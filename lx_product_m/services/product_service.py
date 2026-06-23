@@ -12,6 +12,7 @@ from ..sku import extract_spu
 from .category_service import CategoryService
 
 PRODUCT_DETAIL_API = "/erp/sc/routing/data/local_inventory/batchGetProductInfo"
+PRODUCT_LIST_API = "/erp/sc/routing/data/local_inventory/productList"
 PRODUCT_SET_API = "/erp/sc/routing/storage/product/set"
 
 
@@ -20,6 +21,40 @@ class ProductService:
         self.client = client
         self.db = db
         self.category_service = CategoryService(client, db)
+
+    @staticmethod
+    def _success(result: dict[str, Any]) -> bool:
+        return str(result.get("code")) == "0"
+
+    async def fetch_product_list(
+        self,
+        token: str,
+        page_size: int = 1000,
+        max_pages: int = 0,
+    ) -> list[dict[str, Any]]:
+        """分页读取领星本地产品列表。"""
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        page_no = 0
+        page_size = max(1, min(page_size, 1000))
+        while True:
+            page_no += 1
+            body = {"offset": offset, "length": page_size}
+            result = await self.client.request(token, PRODUCT_LIST_API, "POST", req_body=body)
+            if not self._success(result):
+                raise RuntimeError(f"查询产品列表失败：{result}")
+            items = result.get("data") or []
+            if not items:
+                break
+            rows.extend(items)
+            print(f"产品列表同步中：page={page_no}, 本页={len(items)}, 累计={len(rows)}")
+            if len(items) < page_size:
+                break
+            if max_pages and page_no >= max_pages:
+                break
+            offset += page_size
+            await asyncio.sleep(settings.collection_delay_seconds)
+        return rows
 
     async def batch_get_product_info(self, token: str, skus: list[str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -30,7 +65,7 @@ class ProductService:
             result = await self.client.request(
                 token, PRODUCT_DETAIL_API, "POST", req_body={"skus": batch}
             )
-            if result.get("code") != 0:
+            if not self._success(result):
                 for sku in batch:
                     self.save_product_snapshot_from_error(sku, result)
                 raise RuntimeError(f"查询产品详情失败：{result}")
@@ -108,7 +143,7 @@ class ProductService:
                 (`sku`, `last_api_code`, `last_api_message`, `raw_json`, `synced_at`)
                 VALUES (%s,%s,%s,%s,NOW())
                 """,
-                (sku, result.get("code"), str(result.get("message") or "")[:500], json_dumps(result)),
+                (sku, result.get("code"), str(result.get("message") or result.get("msg") or "")[:500], json_dumps(result)),
             )
 
     async def query_and_save(self, token: str, skus: list[str]) -> list[dict[str, Any]]:
@@ -116,6 +151,12 @@ class ProductService:
         for product in products:
             self.save_product_snapshot(product)
         return products
+
+    async def sync_product_list_snapshot(self, token: str, page_size: int = 1000, max_pages: int = 0) -> int:
+        products = await self.fetch_product_list(token, page_size=page_size, max_pages=max_pages)
+        for product in products:
+            self.save_product_snapshot(product)
+        return len(products)
 
     def resolve_target_category(self, category_id: int | None = None, category_name: str | None = None) -> dict[str, Any]:
         if category_id:
@@ -153,7 +194,7 @@ class ProductService:
         old_id, old_name = self.extract_category(product)
         body = {"sku": sku, "product_name": product_name, "category_id": new_id, "category": new_name}
         response = await self.client.request(token, PRODUCT_SET_API, "POST", req_body=body)
-        if response.get("code") != 0:
+        if not self._success(response):
             self._write_change_log(batch_no, task_id, sku, product_name, old_id, old_name, new_id, new_name, None, "", "failed", body, response, None, str(response))
             raise RuntimeError(f"产品分类写入失败：{response}")
         verify_products = await self.batch_get_product_info(token, [sku])
