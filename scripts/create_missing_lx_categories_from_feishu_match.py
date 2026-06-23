@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         "--category-code-mode",
         choices=["auto", "title", "blank"],
         default="auto",
-        help="新增分类的category_code生成方式，默认auto。不要优先用blank，领星接口可能签名失败",
+        help="新增分类的category_code生成方式，默认auto。领星要求最长10位，只允许数字和字母",
     )
     parser.add_argument("--confirm", action="store_true", help="确认创建领星分类；不加则只预览")
     return parser.parse_args()
@@ -108,24 +108,23 @@ def build_create_plan(target_rows: list[dict], existing: dict[str, dict]) -> lis
 
 def _ascii_segment(text: str) -> str:
     mapping = {
-        "历史": "HIS",
-        "春夏": "SS",
-        "秋冬": "FW",
+        "历史": "H",
+        "春夏": "S",
+        "秋冬": "F",
         "RS款": "RS",
-        "四季款": "ALL",
-        "测试款": "TEST",
-        "基础款": "BASE",
-        "特征款": "FEATURE",
-        "设计师款": "DESIGNER",
-        "S-基础款": "SBASE",
+        "四季款": "A",
+        "测试款": "T",
+        "基础款": "B",
+        "特征款": "R",
+        "设计师款": "D",
+        "S-基础款": "SB",
     }
     text = str(text or "").strip()
     if text in mapping:
         return mapping[text]
     if re.fullmatch(r"\d+", text):
-        return text
-    # 兜底：保留英文数字，其余用X，避免空值。
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+        return text[-2:]
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", text).strip()
     return cleaned.upper() if cleaned else "X"
 
 
@@ -133,10 +132,11 @@ def category_code_for(title: str, path: str, mode: str) -> str:
     if mode == "blank":
         return ""
     if mode == "title":
-        return title
+        return re.sub(r"[^A-Za-z0-9]+", "", title)[:10]
     parts = split_path(path)
-    code = "_".join(_ascii_segment(p) for p in parts)
-    return code[:100] or _ascii_segment(title)
+    code = "".join(_ascii_segment(p) for p in parts)
+    code = re.sub(r"[^A-Za-z0-9]+", "", code)
+    return code[:10] or _ascii_segment(title)[:10]
 
 
 def print_plan(target_rows: list[dict], actions: list[dict], code_mode: str) -> None:
@@ -198,7 +198,9 @@ async def create_actions(actions: list[dict], existing: dict[str, dict], args: a
         )
         data = result.get("data") or []
         new_cid = None
-        if data and isinstance(data[0], dict):
+        if isinstance(data, dict):
+            new_cid = int(data.get("id") or data.get("cid") or 0) or None
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
             new_cid = int(data[0].get("id") or data[0].get("cid") or 0) or None
         if not new_cid:
             raise RuntimeError(f"分类创建成功但未返回分类ID：{result}")
