@@ -19,6 +19,10 @@ class CategoryService:
         self.client = client
         self.db = db
 
+    @staticmethod
+    def _success(result: dict[str, Any]) -> bool:
+        return str(result.get("code")) == "0"
+
     async def fetch_categories(
         self,
         token: str,
@@ -36,7 +40,7 @@ class CategoryService:
                 body["ids"] = ids
 
             result = await self.client.request(token, CATEGORY_LIST_API, "POST", req_body=body)
-            if result.get("code") != 0:
+            if not self._success(result):
                 raise RuntimeError(f"查询分类列表失败：{result}")
 
             rows = result.get("data") or []
@@ -144,7 +148,7 @@ class CategoryService:
 
         body = {"data": [item]}
         result = await self.client.request(token, CATEGORY_SET_API, "POST", req_body=body)
-        status = "success" if result.get("code") == 0 else "failed"
+        status = "success" if self._success(result) else "failed"
         new_cid = cid
         data = result.get("data") or []
         if data and isinstance(data[0], dict):
