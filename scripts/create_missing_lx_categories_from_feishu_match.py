@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 from collections import defaultdict
 from pathlib import Path
 import sys
@@ -32,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="根据飞书匹配表创建领星缺失分类")
     parser.add_argument("--status", default="not_found", help="要处理的匹配状态，默认 not_found")
     parser.add_argument("--max-create", type=int, default=100, help="本次最多允许创建多少个分类节点，默认100")
-    parser.add_argument("--category-code-mode", choices=["blank", "title"], default="blank", help="新增分类的category_code生成方式，默认blank")
+    parser.add_argument(
+        "--category-code-mode",
+        choices=["auto", "title", "blank"],
+        default="auto",
+        help="新增分类的category_code生成方式，默认auto。不要优先用blank，领星接口可能签名失败",
+    )
     parser.add_argument("--confirm", action="store_true", help="确认创建领星分类；不加则只预览")
     return parser.parse_args()
 
@@ -100,16 +106,44 @@ def build_create_plan(target_rows: list[dict], existing: dict[str, dict]) -> lis
     return actions
 
 
+def _ascii_segment(text: str) -> str:
+    mapping = {
+        "历史": "HIS",
+        "春夏": "SS",
+        "秋冬": "FW",
+        "RS款": "RS",
+        "四季款": "ALL",
+        "测试款": "TEST",
+        "基础款": "BASE",
+        "特征款": "FEATURE",
+        "设计师款": "DESIGNER",
+        "S-基础款": "SBASE",
+    }
+    text = str(text or "").strip()
+    if text in mapping:
+        return mapping[text]
+    if re.fullmatch(r"\d+", text):
+        return text
+    # 兜底：保留英文数字，其余用X，避免空值。
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+    return cleaned.upper() if cleaned else "X"
+
+
 def category_code_for(title: str, path: str, mode: str) -> str:
+    if mode == "blank":
+        return ""
     if mode == "title":
         return title
-    return ""
+    parts = split_path(path)
+    code = "_".join(_ascii_segment(p) for p in parts)
+    return code[:100] or _ascii_segment(title)
 
 
-def print_plan(target_rows: list[dict], actions: list[dict]) -> None:
+def print_plan(target_rows: list[dict], actions: list[dict], code_mode: str) -> None:
     print("===== 领星缺失分类创建预览 =====")
     print(f"缺失目标路径数：{len(target_rows)}")
     print(f"需要创建分类节点数：{len(actions)}")
+    print(f"category_code模式：{code_mode}")
     print()
     if target_rows:
         print("--- 缺失目标路径 ---")
@@ -126,7 +160,8 @@ def print_plan(target_rows: list[dict], actions: list[dict]) -> None:
         print("--- 将创建的分类节点，按父级到子级顺序 ---")
         for idx, action in enumerate(actions, 1):
             parent = action["parent_path"] or "ROOT"
-            print(f"{idx:03d}. path={action['path']} | parent={parent} | title={action['title']}")
+            code = category_code_for(action["title"], action["path"], code_mode)
+            print(f"{idx:03d}. path={action['path']} | parent={parent} | title={action['title']} | category_code={code!r}")
 
 
 async def create_actions(actions: list[dict], existing: dict[str, dict], args: argparse.Namespace) -> None:
@@ -190,7 +225,7 @@ async def main() -> None:
     existing = load_existing_categories(db)
     target_rows = load_missing_target_paths(db, args.status)
     actions = build_create_plan(target_rows, existing)
-    print_plan(target_rows, actions)
+    print_plan(target_rows, actions, args.category_code_mode)
 
     if not actions:
         print("无需创建分类节点。")
