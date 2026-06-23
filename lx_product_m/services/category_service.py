@@ -146,12 +146,16 @@ class CategoryService:
             item["id"] = cid
             action_type = "update"
 
-        body = {"data": [item]}
+        # 领星官方 SDK 示例对此接口使用 data=对象，而不是 data=数组。
+        # data=数组在部分账号/接口版本下会返回 api sign not correct。
+        body = {"data": item}
         result = await self.client.request(token, CATEGORY_SET_API, "POST", req_body=body)
         status = "success" if self._success(result) else "failed"
         new_cid = cid
         data = result.get("data") or []
-        if data and isinstance(data[0], dict):
+        if isinstance(data, dict):
+            new_cid = int(data.get("id") or data.get("cid") or new_cid or 0) or None
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
             new_cid = int(data[0].get("id") or data[0].get("cid") or new_cid or 0) or None
 
         with self.db.cursor() as cur:
@@ -171,7 +175,7 @@ class CategoryService:
                     status,
                     json_dumps(body),
                     json_dumps(result),
-                    "" if status == "success" else str(result.get("error_details") or result.get("message") or ""),
+                    "" if status == "success" else str(result.get("error_details") or result.get("message") or result.get("msg") or ""),
                 ),
             )
 
