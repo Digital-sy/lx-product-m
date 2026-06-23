@@ -146,9 +146,8 @@ class CategoryService:
             item["id"] = cid
             action_type = "update"
 
-        # 领星官方 SDK 示例对此接口使用 data=对象，而不是 data=数组。
-        # data=数组在部分账号/接口版本下会返回 api sign not correct。
-        body = {"data": item}
+        # 实测此接口必须使用 data=数组；data=对象会进入内部错误。
+        body = {"data": [item]}
         result = await self.client.request(token, CATEGORY_SET_API, "POST", req_body=body)
         status = "success" if self._success(result) else "failed"
         new_cid = cid
