@@ -28,6 +28,10 @@ class Settings:
     db_database: str = os.getenv("DB_DATABASE", "lingxing")
     db_charset: str = os.getenv("DB_CHARSET", "utf8mb4")
 
+    feishu_app_id: str = os.getenv("FEISHU_APP_ID", "")
+    feishu_app_secret: str = os.getenv("FEISHU_APP_SECRET", "")
+    feishu_api_base: str = os.getenv("FEISHU_API_BASE", "https://open.feishu.cn/open-apis").rstrip("/")
+
     api_timeout_seconds: float = float(os.getenv("API_TIMEOUT_SECONDS", "60"))
     collection_delay_seconds: float = float(os.getenv("COLLECTION_DELAY_SECONDS", "1.2"))
 
@@ -69,6 +73,15 @@ class Settings:
             missing.append("DB_DATABASE")
         if missing:
             raise RuntimeError(f"数据库配置缺失：{', '.join(missing)}")
+
+    def validate_feishu(self) -> None:
+        missing = []
+        if not self.feishu_app_id:
+            missing.append("FEISHU_APP_ID")
+        if not self.feishu_app_secret:
+            missing.append("FEISHU_APP_SECRET")
+        if missing:
+            raise RuntimeError(f"飞书配置缺失：{', '.join(missing)}")
 
     def validate_all(self) -> None:
         self.validate_lingxing()
