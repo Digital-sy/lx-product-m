@@ -78,13 +78,11 @@ def build_create_plan(target_rows: list[dict], existing: dict[str, dict]) -> lis
         parts = split_path(target_path)
         if not parts:
             continue
-        parent_path = ""
         for idx, title in enumerate(parts):
             current_path = "/".join(parts[: idx + 1])
             if current_path not in existing and current_path not in planned_paths:
                 planned_paths.add(current_path)
             sources_by_path[current_path].append(target_path)
-            parent_path = current_path
 
     actions: list[dict] = []
     for path in sorted(planned_paths, key=lambda p: (len(split_path(p)), p)):
@@ -135,7 +133,8 @@ async def create_actions(actions: list[dict], existing: dict[str, dict], args: a
     db = Database()
     client = LingxingClient(db=db)
     service = CategoryService(client, db)
-    token = await client.generate_token()
+    token_info = await client.generate_token()
+    token = token_info.token
 
     created = 0
     for action in actions:
