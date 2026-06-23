@@ -19,7 +19,6 @@ from lx_product_m.feishu_client import FeishuBitableClient, extract_feishu_text
 
 
 def parse_feishu_url(url: str) -> tuple[str | None, str | None, str | None]:
-    """从飞书 bitable URL 尽量提取 app_token/table_id/view_id。"""
     app_token = None
     table_id = None
     view_id = None
@@ -32,7 +31,6 @@ def parse_feishu_url(url: str) -> tuple[str | None, str | None, str | None]:
             table_id = part
         elif part.startswith("vew"):
             view_id = part
-    # 有些链接把 table/view 放在 query 或 hash 中，这里再做一次正则兜底。
     full = url
     if not table_id:
         m = re.search(r"(tbl[a-zA-Z0-9]+)", full)
@@ -57,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-id", help="飞书 view_id，可选")
     parser.add_argument("--limit", type=int, default=5, help="读取样例记录数，默认5")
     parser.add_argument("--json", action="store_true", help="输出原始JSON，方便复制给ChatGPT分析")
+    parser.add_argument("--clean-preview", action="store_true", help="输出款号/开款任务/品线/目标分类路径清洗预览")
     return parser.parse_args()
 
 
@@ -87,6 +86,117 @@ def field_type_name(type_code) -> str:
     return mapping.get(type_code, f"未知类型({type_code})")
 
 
+def collect_options(field: dict) -> dict[str, str]:
+    """提取字段里的 option id -> name 映射。"""
+    options: list[dict] = []
+    prop = field.get("property") or {}
+    if isinstance(prop.get("options"), list):
+        options.extend(prop.get("options") or [])
+    type_info = prop.get("type") or {}
+    if isinstance(type_info, dict):
+        ui_prop = type_info.get("ui_property") or {}
+        if isinstance(ui_prop, dict) and isinstance(ui_prop.get("options"), list):
+            options.extend(ui_prop.get("options") or [])
+    result: dict[str, str] = {}
+    for opt in options:
+        oid = str(opt.get("id") or "").strip()
+        name = str(opt.get("name") or "").strip()
+        if oid:
+            result[oid] = name
+    return result
+
+
+def build_option_maps(fields: list[dict]) -> dict[str, dict[str, str]]:
+    maps: dict[str, dict[str, str]] = {}
+    for field in fields:
+        name = str(field.get("field_name") or "")
+        opt_map = collect_options(field)
+        if name and opt_map:
+            maps[name] = opt_map
+    return maps
+
+
+def readable_value(field_name: str, value, option_maps: dict[str, dict[str, str]]) -> str:
+    opt_map = option_maps.get(field_name) or {}
+    if isinstance(value, list) and opt_map:
+        names = []
+        for item in value:
+            key = str(item)
+            names.append(opt_map.get(key, key))
+        return ", ".join([x for x in names if x])
+    if isinstance(value, str) and opt_map:
+        return opt_map.get(value, value)
+    return extract_feishu_text(value)
+
+
+def parse_task_text(task_text: str) -> tuple[str, str, str]:
+    """从开款任务中解析 年份归类/季节/状态说明。"""
+    task_text = (task_text or "").strip()
+    if not task_text:
+        return "", "", "缺少开款任务"
+
+    year_group = ""
+    season = ""
+
+    m = re.search(r"(历史|\d{2}|20\d{2})", task_text)
+    if m:
+        year_raw = m.group(1)
+        if year_raw == "历史":
+            year_group = "历史"
+        else:
+            yy = int(year_raw[-2:])
+            year_group = "历史" if yy <= 23 else f"{yy:02d}"
+
+    if "春夏" in task_text:
+        season = "春夏"
+    elif "秋冬" in task_text:
+        season = "秋冬"
+
+    problems = []
+    if not year_group:
+        problems.append("未解析年份")
+    if not season:
+        problems.append("未解析季节")
+    return year_group, season, "；".join(problems)
+
+
+def clean_preview(records: list[dict], option_maps: dict[str, dict[str, str]]) -> None:
+    print("\n===== 清洗预览，不写库、不写领星 =====")
+    headers = ["款号", "开款任务", "季节字段", "品线", "解析年份", "解析季节", "目标分类路径", "状态"]
+    widths = [14, 28, 12, 12, 10, 10, 28, 20]
+    print(" ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    print("-" * 140)
+
+    for record in records:
+        row = record.get("fields", {}) or {}
+        style_no = readable_value("款号", row.get("款号"), option_maps)
+        task = readable_value("开款任务", row.get("开款任务"), option_maps)
+        season_field = readable_value("季节", row.get("季节"), option_maps)
+        line = readable_value("品线", row.get("品线"), option_maps)
+        year_group, season, problem = parse_task_text(task)
+        target_path = ""
+        status = "可生成"
+        if year_group and season and line:
+            target_path = f"{year_group}/{season}/{line}"
+        else:
+            status = problem or "字段不足"
+            if not line:
+                status = (status + "；" if status else "") + "缺少品线"
+        values = [style_no, task, season_field, line, year_group, season, target_path, status]
+        print(" ".join(str(v or "")[:w].ljust(w) for v, w in zip(values, widths)))
+
+
+def print_option_maps(option_maps: dict[str, dict[str, str]]) -> None:
+    print("\n===== 字段选项映射 =====")
+    if not option_maps:
+        print("未发现字段选项")
+        return
+    for field_name, opt_map in option_maps.items():
+        print(f"\n{field_name}:")
+        for oid, name in opt_map.items():
+            print(f"  {oid} = {name}")
+
+
 async def main() -> None:
     args = parse_args()
     app_token = args.app_token
@@ -105,6 +215,7 @@ async def main() -> None:
     client = FeishuBitableClient(app_token=app_token, table_id=table_id, view_id=view_id)
     fields = await client.list_fields()
     records = await client.list_records(page_size=max(1, min(args.limit, 500)), max_records=args.limit)
+    option_maps = build_option_maps(fields)
 
     print("===== 飞书表定位信息 =====")
     print(f"app_token: {app_token}")
@@ -119,6 +230,8 @@ async def main() -> None:
         ftype = field.get("type")
         print(f"{idx:02d}. {name} | field_id={fid} | type={field_type_name(ftype)}")
 
+    print_option_maps(option_maps)
+
     print(f"\n===== 样例记录，前 {len(records)} 条 =====")
     for idx, record in enumerate(records, 1):
         print(f"\n--- Record {idx}: {record.get('record_id', '')} ---")
@@ -126,7 +239,10 @@ async def main() -> None:
         for field in fields:
             name = field.get("field_name", "")
             if name in row:
-                print(f"{name}: {extract_feishu_text(row.get(name))}")
+                print(f"{name}: {readable_value(name, row.get(name), option_maps)}")
+
+    if args.clean_preview:
+        clean_preview(records, option_maps)
 
     if args.json:
         output = {
