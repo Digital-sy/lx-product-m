@@ -6,7 +6,8 @@
 1. 不再每个 SKU 写入前查询一次产品详情，直接使用 lxpm_product_category_snapshot.product_name。
 2. 不再每个 SKU 写入后立刻复查，改为写完后按 100 个 SKU 一批批量复查。
 3. 支持 --delay 控制每个写入请求之间的间隔，默认 0.05 秒。
-4. 仍然默认只预览，必须加 --confirm 才写领星。
+4. 写入过程中遇到 access token 失效会自动重新获取 token 并重试当前 SKU。
+5. 仍然默认只预览，必须加 --confirm 才写领星。
 
 适合已经全量同步过 lxpm_product_category_snapshot 后使用。
 """
@@ -26,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from lx_product_m.db import Database, json_dumps
 from lx_product_m.lingxing_client import LingxingClient
-from lx_product_m.services.product_service import PRODUCT_SET_API, ProductService
+from lx_product_m.services.product_service import PRODUCT_DETAIL_API, PRODUCT_SET_API, ProductService
 
 TASK_TABLE = "lxpm_product_category_task"
 MATCH_TABLE = "lxpm_feishu_style_category_match"
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="最多上传多少个SKU，默认0表示不限制")
     parser.add_argument("--show", type=int, default=100, help="预览输出行数，默认100")
     parser.add_argument("--delay", type=float, default=0.05, help="每个写入请求后的等待秒数，默认0.05；报限流可调大")
+    parser.add_argument("--max-retries", type=int, default=3, help="接口失败最大重试次数，默认3")
     parser.add_argument("--verify-batch-size", type=int, default=100, help="批量复查每批SKU数，默认100")
     parser.add_argument("--skip-verify", action="store_true", help="跳过批量复查；不建议正式使用")
     parser.add_argument("--force", action="store_true", help="即使本地快照分类已等于目标分类，也强制写入")
@@ -51,6 +53,19 @@ def parse_args() -> argparse.Namespace:
 
 def make_batch_no() -> str:
     return "feishu_fast_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def is_token_error(resp: dict[str, Any] | None) -> bool:
+    if not resp:
+        return False
+    return str(resp.get("code")) == "2001005" or "token" in str(resp.get("msg") or resp.get("message") or "").lower()
+
+
+def is_retryable_error(resp: dict[str, Any] | None) -> bool:
+    if not resp:
+        return False
+    msg = str(resp.get("msg") or resp.get("message") or "")
+    return str(resp.get("code")) in {"500", "502", "503", "504"} or "请求连接异常" in msg or "稍后再试" in msg
 
 
 def load_candidate_rows(db: Database, statuses: list[str], style_nos: list[str] | None, force: bool, limit: int) -> list[dict[str, Any]]:
@@ -203,9 +218,39 @@ def write_change_log(
     )
 
 
-async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: str, delay: float) -> Counter:
+async def request_with_retry(
+    client: LingxingClient,
+    token: str,
+    api_path: str,
+    body: dict[str, Any],
+    max_retries: int,
+) -> tuple[dict[str, Any], str]:
+    current_token = token
+    last_resp: dict[str, Any] = {}
+    for attempt in range(max_retries + 1):
+        resp = await client.request(current_token, api_path, "POST", req_body=body)
+        last_resp = resp
+        if str(resp.get("code")) == "0":
+            return resp, current_token
+        if is_token_error(resp):
+            print("检测到 access token 失效，重新获取 token 后重试当前请求...")
+            token_info = await client.generate_token()
+            current_token = token_info.token
+            await asyncio.sleep(0.5)
+            continue
+        if is_retryable_error(resp) and attempt < max_retries:
+            wait_s = min(10, 1 + attempt * 2)
+            print(f"接口临时异常，{wait_s}s后重试：{resp}")
+            await asyncio.sleep(wait_s)
+            continue
+        return resp, current_token
+    return last_resp, current_token
+
+
+async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: str, delay: float, max_retries: int) -> Counter:
     client = LingxingClient(db=db, enable_api_log=True)
     token_info = await client.generate_token()
+    token = token_info.token
     counter: Counter = Counter()
     total = len(tasks)
 
@@ -222,7 +267,7 @@ async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: st
         }
         try:
             update_task(db, task_id, "running")
-            resp = await client.request(token_info.token, PRODUCT_SET_API, "POST", req_body=body)
+            resp, token = await request_with_retry(client, token, PRODUCT_SET_API, body, max_retries)
             if str(resp.get("code")) == "0":
                 update_task(db, task_id, "write_success")
                 write_change_log(db, batch_no, task, "write_success", body, resp)
@@ -264,7 +309,34 @@ def load_tasks_for_verify(db: Database, batch_no: str) -> list[dict[str, Any]]:
     )
 
 
-async def verify_tasks(db: Database, batch_no: str, batch_size: int) -> Counter:
+async def verify_batch_with_retry(
+    client: LingxingClient,
+    token: str,
+    batch: list[str],
+    max_retries: int,
+) -> tuple[list[dict[str, Any]], str]:
+    current_token = token
+    body = {"skus": batch}
+    for attempt in range(max_retries + 1):
+        resp = await client.request(current_token, PRODUCT_DETAIL_API, "POST", req_body=body)
+        if str(resp.get("code")) == "0":
+            return list(resp.get("data") or []), current_token
+        if is_token_error(resp):
+            print("复查时 token 失效，重新获取 token 后重试...")
+            token_info = await client.generate_token()
+            current_token = token_info.token
+            await asyncio.sleep(0.5)
+            continue
+        if is_retryable_error(resp) and attempt < max_retries:
+            wait_s = min(10, 1 + attempt * 2)
+            print(f"复查接口临时异常，{wait_s}s后重试：{resp}")
+            await asyncio.sleep(wait_s)
+            continue
+        raise RuntimeError(f"批量复查失败：{resp}")
+    raise RuntimeError("批量复查失败：超过最大重试次数")
+
+
+async def verify_tasks(db: Database, batch_no: str, batch_size: int, max_retries: int) -> Counter:
     tasks = load_tasks_for_verify(db, batch_no)
     if not tasks:
         return Counter()
@@ -273,13 +345,24 @@ async def verify_tasks(db: Database, batch_no: str, batch_size: int) -> Counter:
 
     client = LingxingClient(db=db, enable_api_log=True)
     token_info = await client.generate_token()
+    token = token_info.token
     service = ProductService(client, db)
     counter: Counter = Counter()
     batch_size = max(1, min(batch_size, 100))
 
     for i in range(0, len(skus), batch_size):
         batch = skus[i:i + batch_size]
-        products = await service.batch_get_product_info(token_info.token, batch)
+        try:
+            products, token = await verify_batch_with_retry(client, token, batch, max_retries)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            for sku in batch:
+                task = task_by_sku[sku]
+                update_task(db, int(task["task_id"]), "verify_failed", err)
+                write_change_log(db, batch_no, task, "verify_failed", None, None, None, err)
+                counter["verify_failed"] += 1
+            print(f"复查进度：{min(i + batch_size, len(skus))}/{len(skus)}，{dict(counter)}")
+            continue
         returned = {str(p.get("sku") or p.get("SKU") or ""): p for p in products}
         for sku in batch:
             task = task_by_sku[sku]
@@ -329,14 +412,14 @@ async def main() -> None:
 
     tasks = insert_tasks(db, batch_no, rows)
     print(f"\n已创建任务：{len(tasks)} 条，开始快速写入领星...")
-    write_counter = await write_products(db, tasks, batch_no, args.delay)
+    write_counter = await write_products(db, tasks, batch_no, args.delay, args.max_retries)
     print(f"写入完成：{dict(write_counter)}")
 
     if args.skip_verify:
         print("已跳过复查。")
         return
     print("开始批量复查...")
-    verify_counter = await verify_tasks(db, batch_no, args.verify_batch_size)
+    verify_counter = await verify_tasks(db, batch_no, args.verify_batch_size, args.max_retries)
     print("\n===== 快速上传完成 =====")
     print(f"写入：{dict(write_counter)}")
     print(f"复查：{dict(verify_counter)}")
