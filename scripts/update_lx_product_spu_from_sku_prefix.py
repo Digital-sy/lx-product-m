@@ -3,11 +3,15 @@
 """把领星产品管理里的 SPU 字段写成 SKU 前缀。
 
 规则：
-  BQ084-BK-L  -> BQ084
+  BQ084-BK-L   -> BQ084
   ZSY961-SC-XS -> ZSY961
 
+说明：
+  领星 batchGetProductInfo 返回中没有 spu 字段，但常见可写字段里有 model / sku_identifier。
+  因此脚本默认先用 model 字段写入；如前台不生效，可用 --field-name sku_identifier 单个 SKU 测试。
+
 默认只预览，不写领星；必须加 --confirm 才执行。
-正式跑之前建议先 --limit 20 小批量验证。
+正式跑之前建议先 --sku 单个 SKU 或 --limit 20 小批量验证。
 """
 from __future__ import annotations
 
@@ -34,6 +38,9 @@ TASK_TABLE = "lxpm_product_spu_write_task"
 CHANGE_LOG_TABLE = "lxpm_product_spu_change_log"
 
 SPU_KEYS = (
+    "model",
+    "sku_identifier",
+    "skuIdentifier",
     "spu",
     "SPU",
     "product_spu",
@@ -56,9 +63,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.1, help="每个写入请求后的等待秒数，默认0.1")
     parser.add_argument("--max-retries", type=int, default=5, help="接口失败最大重试次数，默认5")
     parser.add_argument("--verify-batch-size", type=int, default=100, help="批量复查每批SKU数，默认100")
-    parser.add_argument("--field-name", default="spu", help="写入领星 product/set 的字段名，默认 spu；如接口字段不同可改")
-    parser.add_argument("--only-empty", action="store_true", help="仅当当前SPU为空时写入；默认当前SPU不同也写入")
-    parser.add_argument("--force", action="store_true", help="即使当前SPU已等于SKU前缀，也强制写入")
+    parser.add_argument(
+        "--field-name",
+        default="model",
+        help="写入领星 product/set 的字段名，默认 model；如前台不生效可试 sku_identifier",
+    )
+    parser.add_argument("--only-empty", action="store_true", help="仅当当前字段为空时写入；默认当前值不同也写入")
+    parser.add_argument("--force", action="store_true", help="即使当前字段已等于SKU前缀，也强制写入")
     parser.add_argument("--skip-verify", action="store_true", help="跳过批量复查；不建议正式使用")
     parser.add_argument("--confirm", action="store_true", help="确认写入领星；不加只预览")
     return parser.parse_args()
@@ -77,9 +88,9 @@ def ensure_tables(db: Database) -> None:
               `batch_no` VARCHAR(100) NOT NULL COMMENT '批次号',
               `sku` VARCHAR(200) NOT NULL COMMENT 'SKU',
               `product_name` VARCHAR(500) DEFAULT '' COMMENT '品名',
-              `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前领星返回的SPU',
+              `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前领星返回字段值',
               `target_spu` VARCHAR(200) NOT NULL COMMENT '目标SPU，来自SKU前缀',
-              `field_name` VARCHAR(100) NOT NULL DEFAULT 'spu' COMMENT '写入product/set的字段名',
+              `field_name` VARCHAR(100) NOT NULL DEFAULT 'model' COMMENT '写入product/set的字段名',
               `status` VARCHAR(50) NOT NULL DEFAULT 'pending' COMMENT 'pending/running/write_success/success/failed/verify_failed/skipped',
               `error_message` TEXT NULL COMMENT '失败原因',
               `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -100,10 +111,10 @@ def ensure_tables(db: Database) -> None:
               `task_id` BIGINT DEFAULT NULL COMMENT '任务ID',
               `sku` VARCHAR(200) NOT NULL COMMENT 'SKU',
               `product_name` VARCHAR(500) DEFAULT '' COMMENT '品名',
-              `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前SPU',
+              `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前字段值',
               `new_spu` VARCHAR(200) DEFAULT '' COMMENT '目标SPU',
-              `verify_spu` VARCHAR(200) DEFAULT '' COMMENT '复查SPU',
-              `field_name` VARCHAR(100) NOT NULL DEFAULT 'spu' COMMENT '写入product/set的字段名',
+              `verify_spu` VARCHAR(200) DEFAULT '' COMMENT '复查字段值',
+              `field_name` VARCHAR(100) NOT NULL DEFAULT 'model' COMMENT '写入product/set的字段名',
               `status` VARCHAR(50) NOT NULL COMMENT 'write_success/success/failed/verify_failed/skipped',
               `request_json` JSON NULL COMMENT '写入请求体',
               `response_json` JSON NULL COMMENT '写入响应体',
@@ -132,13 +143,26 @@ def parse_json_maybe(value: Any) -> Any:
         return None
 
 
-def extract_current_spu_from_product(product: dict[str, Any] | None) -> str:
+def _value_to_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    return str(value).strip()
+
+
+def extract_current_spu_from_product(product: dict[str, Any] | None, field_name: str = "") -> str:
     if not isinstance(product, dict):
         return ""
+
+    # 优先读取本次尝试写入的字段，避免 model / sku_identifier 混淆。
+    if field_name:
+        value = product.get(field_name)
+        if value not in (None, ""):
+            return _value_to_text(value)
+
     for key in SPU_KEYS:
         value = product.get(key)
         if value not in (None, ""):
-            return str(value).strip()
+            return _value_to_text(value)
 
     custom_fields = product.get("custom_fields") or product.get("custom_field_list") or product.get("customFields") or product.get("customFieldList")
     if isinstance(custom_fields, list):
@@ -152,9 +176,9 @@ def extract_current_spu_from_product(product: dict[str, Any] | None) -> str:
                 or item.get("title")
                 or ""
             ).strip().lower()
-            if name in {"spu", "父sku", "父sku编码", "款号"}:
+            if name in {"spu", "父sku", "父sku编码", "款号", "model", "sku_identifier"}:
                 value = item.get("value") or item.get("field_value") or item.get("fieldValue") or item.get("text") or ""
-                return str(value).strip()
+                return _value_to_text(value)
     return ""
 
 
@@ -175,6 +199,7 @@ def load_candidate_rows(
     force: bool,
     only_empty: bool,
     limit: int,
+    field_name: str,
 ) -> list[dict[str, Any]]:
     sql = f"""
         SELECT sku, product_name, raw_json
@@ -200,7 +225,7 @@ def load_candidate_rows(
         sku = str(row.get("sku") or "").strip()
         target_spu = extract_spu(sku)
         raw_json = parse_json_maybe(row.get("raw_json"))
-        old_spu = extract_current_spu_from_product(raw_json if isinstance(raw_json, dict) else None)
+        old_spu = extract_current_spu_from_product(raw_json if isinstance(raw_json, dict) else None, field_name=field_name)
         if not should_write(old_spu, target_spu, force=force, only_empty=only_empty):
             continue
         item = dict(row)
@@ -218,7 +243,7 @@ def print_preview(rows: list[dict[str, Any]], show: int, batch_no: str, field_na
     print(f"写入字段名：{field_name}")
     print(f"待写入SKU数：{len(rows)}")
     print()
-    headers = ["SKU", "当前SPU", "目标SPU", "产品名"]
+    headers = ["SKU", "当前字段值", "目标SPU", "产品名"]
     widths = [32, 20, 20, 48]
     print(" ".join(h.ljust(w) for h, w in zip(headers, widths)))
     print("-" * 130)
@@ -294,7 +319,7 @@ def write_change_log(
             task.get("old_spu") or "",
             task.get("target_spu") or "",
             verify_spu or "",
-            task.get("field_name") or "spu",
+            task.get("field_name") or "model",
             status,
             json_dumps(request_json),
             json_dumps(response_json),
@@ -355,7 +380,7 @@ async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: st
 
     for idx, task in enumerate(tasks, 1):
         task_id = int(task["task_id"])
-        field_name = str(task.get("field_name") or "spu")
+        field_name = str(task.get("field_name") or "model")
         body = {
             "sku": str(task.get("sku") or ""),
             "product_name": str(task.get("product_name") or ""),
@@ -458,16 +483,17 @@ async def verify_tasks(db: Database, batch_no: str, batch_size: int, max_retries
             task = task_by_sku[sku]
             product = returned.get(sku)
             target_spu = str(task.get("target_spu") or "")
+            field_name = str(task.get("field_name") or "model")
             if not product:
                 update_task(db, int(task["task_id"]), "verify_failed", "复查未返回SKU")
                 write_change_log(db, batch_no, task, "verify_failed", None, None, {"data": products}, "复查未返回SKU")
                 counter["verify_failed"] += 1
                 continue
             service.save_product_snapshot(product)
-            verify_spu = extract_current_spu_from_product(product)
+            verify_spu = extract_current_spu_from_product(product, field_name=field_name)
             ok = verify_spu == target_spu
             status = "success" if ok else "verify_failed"
-            err = "" if ok else f"复查SPU不一致：verify_spu={verify_spu!r}, target_spu={target_spu!r}"
+            err = "" if ok else f"复查字段不一致：field_name={field_name!r}, verify_value={verify_spu!r}, target_spu={target_spu!r}"
             update_task(db, int(task["task_id"]), status, err)
             write_change_log(
                 db,
@@ -496,6 +522,7 @@ async def main() -> None:
         force=args.force,
         only_empty=args.only_empty,
         limit=args.limit,
+        field_name=args.field_name,
     )
     print_preview(rows, args.show, batch_no, args.field_name)
 
