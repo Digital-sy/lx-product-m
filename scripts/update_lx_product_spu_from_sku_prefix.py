@@ -6,10 +6,13 @@
   BQ084-BK-L   -> BQ084
   ZSY961-SC-XS -> ZSY961
 
-重要说明：
-  已验证 product/set 的 model 字段会写到前台「型号」，不是 SPU，默认禁止写 model。
-  当前脚本必须显式传 --field-name 才允许 --confirm 写入。
-  正式全量前必须先单个 SKU 验证：复查 success，且前台 SPU 字段确实变化。
+领星文档字段：
+  api_spu            SPU
+  api_spu_attribute  属性列表；填写 api_spu 时文档要求该字段同时传入
+
+重要：
+  product/set 的 model 字段是前台「型号」，不是 SPU，默认禁止写 model。
+  正式全量前必须先单个 SKU 测试并到前台确认 SPU 字段确实变化。
 """
 from __future__ import annotations
 
@@ -36,6 +39,8 @@ TASK_TABLE = "lxpm_product_spu_write_task"
 CHANGE_LOG_TABLE = "lxpm_product_spu_change_log"
 
 CANDIDATE_KEYS = (
+    "api_spu",
+    "apiSpu",
     "spu",
     "SPU",
     "product_spu",
@@ -60,7 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.1, help="每个写入请求后的等待秒数，默认0.1")
     parser.add_argument("--max-retries", type=int, default=5, help="接口失败最大重试次数，默认5")
     parser.add_argument("--verify-batch-size", type=int, default=100, help="批量复查每批SKU数，默认100")
-    parser.add_argument("--field-name", default="", help="写入领星 product/set 的字段名。必须显式指定；禁止默认猜测。")
+    parser.add_argument("--field-name", default="api_spu", help="写入字段名，默认 api_spu。model 是型号，默认禁止。")
+    parser.add_argument(
+        "--api-spu-attribute-json",
+        default="[]",
+        help="api_spu_attribute 的JSON数组。文档要求填写 api_spu 时同时填写属性列表；默认 [] 仅用于先验证接口返回。",
+    )
     parser.add_argument("--allow-model", action="store_true", help="允许写入 model 字段。谨慎：model 已验证是前台型号，不是SPU。")
     parser.add_argument("--only-empty", action="store_true", help="仅当当前字段为空时写入；默认当前值不同也写入")
     parser.add_argument("--force", action="store_true", help="即使当前字段已等于SKU前缀，也强制写入")
@@ -71,6 +81,19 @@ def parse_args() -> argparse.Namespace:
 
 def make_batch_no() -> str:
     return "spu_write_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def parse_api_spu_attribute_json(value: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"--api-spu-attribute-json 不是合法JSON：{exc}") from exc
+    if not isinstance(parsed, list):
+        raise SystemExit("--api-spu-attribute-json 必须是JSON数组，例如 '[{\"pa_id\":1,\"pai_id\":101}]'")
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise SystemExit("--api-spu-attribute-json 数组元素必须是对象")
+    return parsed
 
 
 def ensure_tables(db: Database) -> None:
@@ -84,7 +107,7 @@ def ensure_tables(db: Database) -> None:
               `product_name` VARCHAR(500) DEFAULT '' COMMENT '品名',
               `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前领星返回字段值',
               `target_spu` VARCHAR(200) NOT NULL COMMENT '目标SPU，来自SKU前缀',
-              `field_name` VARCHAR(100) NOT NULL DEFAULT '' COMMENT '写入product/set的字段名',
+              `field_name` VARCHAR(100) NOT NULL DEFAULT 'api_spu' COMMENT '写入product/set的字段名',
               `status` VARCHAR(50) NOT NULL DEFAULT 'pending' COMMENT 'pending/running/write_success/success/failed/verify_failed/skipped',
               `error_message` TEXT NULL COMMENT '失败原因',
               `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -108,7 +131,7 @@ def ensure_tables(db: Database) -> None:
               `old_spu` VARCHAR(200) DEFAULT '' COMMENT '写入前字段值',
               `new_spu` VARCHAR(200) DEFAULT '' COMMENT '目标SPU',
               `verify_spu` VARCHAR(200) DEFAULT '' COMMENT '复查字段值',
-              `field_name` VARCHAR(100) NOT NULL DEFAULT '' COMMENT '写入product/set的字段名',
+              `field_name` VARCHAR(100) NOT NULL DEFAULT 'api_spu' COMMENT '写入product/set的字段名',
               `status` VARCHAR(50) NOT NULL COMMENT 'write_success/success/failed/verify_failed/skipped',
               `request_json` JSON NULL COMMENT '写入请求体',
               `response_json` JSON NULL COMMENT '写入响应体',
@@ -143,11 +166,17 @@ def value_to_text(value: Any) -> str:
     return str(value).strip()
 
 
-def extract_current_value(product: dict[str, Any] | None, field_name: str = "") -> str:
+def extract_current_value(product: dict[str, Any] | None, field_name: str = "api_spu") -> str:
     if not isinstance(product, dict):
         return ""
     if field_name:
-        return value_to_text(product.get(field_name))
+        value = value_to_text(product.get(field_name))
+        if value:
+            return value
+        if field_name == "api_spu":
+            value = value_to_text(product.get("apiSpu"))
+            if value:
+                return value
     for key in CANDIDATE_KEYS:
         val = value_to_text(product.get(key))
         if val:
@@ -158,7 +187,7 @@ def extract_current_value(product: dict[str, Any] | None, field_name: str = "") 
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or item.get("field_name") or item.get("fieldName") or item.get("title") or "").strip().lower()
-            if name in {"spu", "父sku", "父sku编码", "款号"}:
+            if name in {"spu", "父sku", "父sku编码", "款号", "api_spu"}:
                 return value_to_text(item.get("value") or item.get("field_value") or item.get("fieldValue") or item.get("text"))
     return ""
 
@@ -210,10 +239,12 @@ def load_candidate_rows(db: Database, skus: list[str] | None, sku_like: str, for
     return candidates
 
 
-def print_preview(rows: list[dict[str, Any]], show: int, batch_no: str, field_name: str) -> None:
+def print_preview(rows: list[dict[str, Any]], show: int, batch_no: str, field_name: str, api_spu_attribute: list[dict[str, Any]]) -> None:
     print("===== 预览：领星产品 SPU 字段写入 =====")
     print(f"批次号：{batch_no}")
-    print(f"写入字段名：{field_name or '未指定'}")
+    print(f"写入字段名：{field_name}")
+    if field_name == "api_spu":
+        print(f"api_spu_attribute：{json.dumps(api_spu_attribute, ensure_ascii=False)}")
     print(f"待写入SKU数：{len(rows)}")
     print()
     headers = ["SKU", "当前字段值", "目标SPU", "产品名"]
@@ -256,7 +287,7 @@ def write_change_log(db: Database, batch_no: str, task: dict[str, Any], status: 
          `field_name`, `status`, `request_json`, `response_json`, `verify_response_json`, `error_message`)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (batch_no, task.get("task_id"), task.get("sku"), task.get("product_name") or "", task.get("old_spu") or "", task.get("target_spu") or "", verify_spu or "", task.get("field_name") or "", status, json_dumps(request_json), json_dumps(response_json), json_dumps(verify_json), error_message[:5000]),
+        (batch_no, task.get("task_id"), task.get("sku"), task.get("product_name") or "", task.get("old_spu") or "", task.get("target_spu") or "", verify_spu or "", task.get("field_name") or "api_spu", status, json_dumps(request_json), json_dumps(response_json), json_dumps(verify_json), error_message[:5000]),
     )
 
 
@@ -295,15 +326,28 @@ async def request_with_retry(client: LingxingClient, token: str, api_path: str, 
     return last_resp, current_token
 
 
-async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: str, delay: float, max_retries: int) -> Counter:
+def build_request_body(task: dict[str, Any], api_spu_attribute: list[dict[str, Any]]) -> dict[str, Any]:
+    field_name = str(task.get("field_name") or "api_spu")
+    body = {
+        "sku": str(task.get("sku") or ""),
+        "product_name": str(task.get("product_name") or ""),
+    }
+    if field_name == "api_spu":
+        body["api_spu"] = str(task.get("target_spu") or "")
+        body["api_spu_attribute"] = api_spu_attribute
+    else:
+        body[field_name] = str(task.get("target_spu") or "")
+    return body
+
+
+async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: str, delay: float, max_retries: int, api_spu_attribute: list[dict[str, Any]]) -> Counter:
     client = LingxingClient(db=db, enable_api_log=True)
     token = (await client.generate_token()).token
     counter: Counter = Counter()
     total = len(tasks)
     for idx, task in enumerate(tasks, 1):
         task_id = int(task["task_id"])
-        field_name = str(task.get("field_name") or "")
-        body = {"sku": str(task.get("sku") or ""), "product_name": str(task.get("product_name") or ""), field_name: str(task.get("target_spu") or "")}
+        body = build_request_body(task, api_spu_attribute)
         try:
             update_task(db, task_id, "running")
             resp, token = await request_with_retry(client, token, PRODUCT_SET_API, body, max_retries)
@@ -382,7 +426,7 @@ async def verify_tasks(db: Database, batch_no: str, batch_size: int, max_retries
             task = task_by_sku[sku]
             product = returned.get(sku)
             target_spu = str(task.get("target_spu") or "")
-            field_name = str(task.get("field_name") or "")
+            field_name = str(task.get("field_name") or "api_spu")
             if not product:
                 update_task(db, int(task["task_id"]), "verify_failed", "复查未返回SKU")
                 write_change_log(db, batch_no, task, "verify_failed", None, None, {"data": products}, "复查未返回SKU")
@@ -402,10 +446,13 @@ async def verify_tasks(db: Database, batch_no: str, batch_size: int, max_retries
 
 async def main() -> None:
     args = parse_args()
+    if args.field_name == "model" and not args.allow_model:
+        raise SystemExit("错误：model 已验证会写入前台『型号』，不是 SPU。禁止继续；如确实要写型号，需额外加 --allow-model。")
+    api_spu_attribute = parse_api_spu_attribute_json(args.api_spu_attribute_json)
     batch_no = args.batch_no or make_batch_no()
     db = Database()
     rows = load_candidate_rows(db, args.sku, args.sku_like, args.force, args.only_empty, args.limit, args.field_name)
-    print_preview(rows, args.show, batch_no, args.field_name)
+    print_preview(rows, args.show, batch_no, args.field_name, api_spu_attribute)
 
     if not rows:
         print("没有需要写入的SKU。")
@@ -413,15 +460,13 @@ async def main() -> None:
     if not args.confirm:
         print("\n当前为预览模式，未创建任务、未写领星。确认无误后加 --confirm 执行。")
         return
-    if not args.field_name:
-        raise SystemExit("错误：当前不知道领星 SPU 的真实接口字段名。必须先通过前台 F12 获取保存 SPU 的 payload，再显式传 --field-name。")
-    if args.field_name == "model" and not args.allow_model:
-        raise SystemExit("错误：model 已验证会写入前台『型号』，不是 SPU。禁止继续；如确实要写型号，需额外加 --allow-model。")
+    if args.field_name == "api_spu" and not api_spu_attribute:
+        print("警告：文档说明填写 api_spu 时 api_spu_attribute 必填；当前传入 []，如果接口失败，需要先获取属性ID和值ID。")
 
     ensure_tables(db)
     tasks = insert_tasks(db, batch_no, rows, args.field_name)
     print(f"\n已创建任务：{len(tasks)} 条，开始写入领星产品字段 {args.field_name}...")
-    write_counter = await write_products(db, tasks, batch_no, args.delay, args.max_retries)
+    write_counter = await write_products(db, tasks, batch_no, args.delay, args.max_retries, api_spu_attribute)
     print(f"写入完成：{dict(write_counter)}")
     if args.skip_verify:
         print("已跳过复查。")
