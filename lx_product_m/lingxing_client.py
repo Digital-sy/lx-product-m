@@ -53,7 +53,7 @@ class LingxingClient:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         payload = resp.json()
-        if payload.get("code") != 200:
+        if str(payload.get("code")) != "200":
             raise RuntimeError(f"获取领星令牌失败：{payload}")
         token_data = payload.get("data") or {}
         token_value = token_data.get(TOKEN_PARAM) or token_data.get("accessToken")
@@ -129,9 +129,9 @@ class LingxingClient:
     ) -> None:
         response_json = response_json or {}
         code = response_json.get("code")
-        message = str(response_json.get("message") or "")
+        message = str(response_json.get("message") or response_json.get("msg") or "")
         request_id = str(response_json.get("request_id") or "")
-        success = 1 if code == 0 and not error_message else 0
+        success = 1 if str(code) == "0" and not error_message else 0
         try:
             with self.db.cursor() as cur:
                 cur.execute(
