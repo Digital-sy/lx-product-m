@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="可选，限制候选数量")
     p.add_argument("--show", type=int, default=30, help="预览显示条数")
     p.add_argument("--attribute-json", required=True, help='例如 [{"pa_id":340,"pai_id":3909}]')
-    p.add_argument("--delay", type=float, default=0.2, help="每条间隔秒数")
+    p.add_argument("--delay", type=float, default=0.2, help="每个SPU组处理后的等待秒数，默认0.2")
     p.add_argument("--refresh-seconds", type=int, default=1200, help="访问凭据刷新间隔秒数，默认20分钟")
     p.add_argument("--confirm", action="store_true", help="确认写入；不加只预览")
     return p.parse_args()
@@ -102,11 +102,6 @@ def load_candidates(db: Database, sku_like: str, limit: int, known: set[str]) ->
     return rows, skipped
 
 
-def already_bound_error(exc: Exception) -> bool:
-    text = str(exc)
-    return "当前已经关联" in text or "已经关联了" in text
-
-
 def token_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
@@ -117,16 +112,11 @@ def token_error(exc: Exception) -> bool:
     )
 
 
-async def bind_one(service: SpuService, token: str, row: dict[str, str], attr: list[dict[str, Any]], batch_no: str) -> str:
-    result = await service.ensure_spu_and_bind_sku(
-        token,
-        spu=row["spu"],
-        sku=row["sku"],
-        product_name=row["product_name"],
-        sku_attribute=attr,
-        batch_no=batch_no,
-    )
-    return str(result.get("status") or "success")
+def group_by_spu(rows: list[dict[str, str]]) -> list[tuple[str, list[dict[str, str]]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(row["spu"], []).append(row)
+    return list(grouped.items())
 
 
 async def main() -> None:
@@ -138,12 +128,13 @@ async def main() -> None:
 
     known = load_known_bound(db)
     rows, skipped_known = load_candidates(db, args.sku_like, args.limit, known)
+    groups = group_by_spu(rows)
 
     print("===== 每日SPU绑定任务 =====")
     print("批次号：", batch_no)
     print("历史已绑定跳过：", skipped_known)
-    print("本次待处理：", len(rows))
-    print("目标SPU数：", len({r["spu"] for r in rows}))
+    print("本次待处理SKU：", len(rows))
+    print("本次待处理SPU组：", len(groups))
     print("attribute：", json.dumps(attr, ensure_ascii=False))
     for r in rows[: args.show]:
         print(r["sku"], "->", r["spu"], r["product_name"][:60])
@@ -164,29 +155,43 @@ async def main() -> None:
         token_at = time.monotonic()
         return new_token
 
-    for i, r in enumerate(rows, 1):
+    for i, (spu, group_rows) in enumerate(groups, 1):
         if args.refresh_seconds and time.monotonic() - token_at >= args.refresh_seconds:
             token = await refresh_token("定时刷新")
         try:
-            status = await bind_one(service, token, r, attr, batch_no)
-            counter[status] += 1
-            print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} {status}")
+            result = await service.ensure_spu_and_bind_skus(
+                token,
+                spu=spu,
+                sku_rows=group_rows,
+                sku_attribute=attr,
+                batch_no=batch_no,
+            )
         except Exception as exc:  # noqa: BLE001
             if token_error(exc):
                 try:
                     token = await refresh_token(f"检测到访问凭据异常：{exc}")
-                    status = await bind_one(service, token, r, attr, batch_no)
-                    counter[status] += 1
-                    print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} {status} after_auth_refresh")
+                    result = await service.ensure_spu_and_bind_skus(
+                        token,
+                        spu=spu,
+                        sku_rows=group_rows,
+                        sku_attribute=attr,
+                        batch_no=batch_no,
+                    )
                 except Exception as retry_exc:  # noqa: BLE001
-                    counter["failed"] += 1
-                    print(f"[{i}/{len(rows)}] FAILED {r['sku']} -> {r['spu']} after_auth_refresh: {retry_exc}")
-            elif already_bound_error(exc):
-                counter["skipped_already_bound"] += 1
-                print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} skipped_already_bound")
+                    counter["failed"] += len(group_rows)
+                    print(f"[{i}/{len(groups)}] FAILED GROUP {spu} after_auth_refresh: {retry_exc}")
+                    result = None
             else:
-                counter["failed"] += 1
-                print(f"[{i}/{len(rows)}] FAILED {r['sku']} -> {r['spu']}: {exc}")
+                counter["failed"] += len(group_rows)
+                print(f"[{i}/{len(groups)}] FAILED GROUP {spu}: {exc}")
+                result = None
+        if result:
+            group_counter = Counter()
+            for status, skus in result.items():
+                if isinstance(skus, list):
+                    counter[status] += len(skus)
+                    group_counter[status] += len(skus)
+            print(f"[{i}/{len(groups)}] SPU={spu} SKU数={len(group_rows)} 结果={dict(group_counter)}")
         if args.delay:
             await asyncio.sleep(args.delay)
 
