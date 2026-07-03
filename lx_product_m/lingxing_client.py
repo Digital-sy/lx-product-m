@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+import orjson
 
 from .config import settings
 from .db import Database, json_dumps
@@ -53,7 +54,7 @@ class LingxingClient:
 
     async def generate_token(self) -> AccessToken:
         url = self.host + "/api/auth-server/oauth/access-token"
-        data = {APP_ID_FIELD: self.app_id, APP_SECRET_FIELD: self.app_secret}
+        data = {APP_SECRET_FIELD: self.app_secret, APP_ID_FIELD: self.app_id}
         client = await self._client()
         resp = await client.post(
             url,
@@ -83,7 +84,7 @@ class LingxingClient:
     ) -> dict[str, Any]:
         method = method.upper()
         req_body = req_body or {}
-        req_params = req_params or {}
+        req_params = dict(req_params or {})
         url = self.host + api_path
 
         sign_source = dict(req_body)
@@ -102,13 +103,12 @@ class LingxingClient:
         error_message = ""
         try:
             client = await self._client()
-            resp = await client.request(
-                method,
-                url,
-                params=req_params,
-                json=req_body if req_body else None,
-                headers={"Content-Type": "application/json"} if req_body else None,
-            )
+            request_kwargs: dict[str, Any] = {"params": req_params}
+            if req_body:
+                # 与签名中的 nested dict/list 序列化保持一致，避免复杂 sku_list 在服务端验签异常。
+                request_kwargs["content"] = orjson.dumps(req_body, option=orjson.OPT_SORT_KEYS)
+                request_kwargs["headers"] = {"Content-Type": "application/json"}
+            resp = await client.request(method, url, **request_kwargs)
             response_payload = resp.json()
             return response_payload
         except Exception as exc:
