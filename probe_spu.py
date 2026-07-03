@@ -3,10 +3,13 @@
 """SPU 探测脚本。
 
 用途：
-1. 读取侧：调 batchGetProductInfo，打印返回里所有和 spu/属性 相关的字段名，
-   确认复查校验时应该读哪个 key（建议先在 ERP 界面手工给该 SKU 挂一个 SPU）。
-2. 写入侧：逐个试探候选的多属性产品接口路径，看哪个不是"路由不存在"，
-   从而确认真实路径。所有调用都会照常落到 lxpm_api_call_log，方便回看。
+1. 读取侧：调 batchGetProductInfo，打印返回里所有和 spu/属性 相关的字段名。
+2. 写入侧：探测多属性产品列表/详情/属性列表接口路径。
+
+说明：
+- batchGetProductInfo 实测可能不返回 SPU 字段，即使前台已挂 SPU。
+- 正式复查建议以查询多属性产品列表/详情为准。
+- 本脚本只探测查询类接口，不调用 spu/set 写入接口。
 
 用法：
     python probe_spu.py <SKU>
@@ -22,19 +25,26 @@ from lx_product_m.lingxing_client import LingxingClient
 
 PRODUCT_DETAIL_API = "/erp/sc/routing/data/local_inventory/batchGetProductInfo"
 
-# 候选路径（以你们开放接口后台文档为准，探测通过后写进 spu_service.py）
+# 官方文档路径优先；后面保留旧候选路径用于排查不同版本路由。
 SPU_LIST_CANDIDATES = [
+    "/erp/sc/routing/storage/spu/spuList",
+    "/erp/sc/routing/storage/spu/list",
     "/erp/sc/routing/data/local_inventory/spuList",
     "/erp/sc/routing/data/local_inventory/spu/list",
     "/erp/sc/storage/spu/list",
 ]
 SPU_INFO_CANDIDATES = [
+    "/erp/sc/routing/storage/spu/info",
+    "/erp/sc/routing/storage/spu/spuInfo",
     "/erp/sc/routing/data/local_inventory/spuInfo",
     "/erp/sc/routing/data/local_inventory/spu/info",
 ]
 ATTRIBUTE_LIST_CANDIDATES = [
-    "/erp/sc/routing/data/local_inventory/attribute",
+    "/erp/sc/routing/storage/productAttribute/list",
+    "/erp/sc/routing/storage/product_attribute/list",
+    "/erp/sc/routing/storage/spu/attribute/list",
     "/erp/sc/routing/storage/attribute/list",
+    "/erp/sc/routing/data/local_inventory/attribute",
 ]
 
 
@@ -95,7 +105,8 @@ async def main() -> None:
                 r = await client.request(token, path, "POST", req_body=body)
                 code = r.get("code")
                 msg = str(r.get("message") or r.get("msg") or "")[:120]
-                print(f"  {path}\n    -> code={code} msg={msg}")
+                details = str(r.get("error_details") or "")[:160]
+                print(f"  {path}\n    -> code={code} msg={msg} details={details}")
             except Exception as exc:
                 print(f"  {path}\n    -> 异常: {exc}")
             await asyncio.sleep(1.2)
@@ -104,8 +115,8 @@ async def main() -> None:
     await probe("查询多属性产品详情", SPU_INFO_CANDIDATES, {"spu": "PROBE_NOT_EXIST"})
     await probe("查询产品属性列表", ATTRIBUTE_LIST_CANDIDATES, {"offset": 0, "length": 20})
 
-    print("\n判断标准：返回『路由/接口不存在』类错误 = 路径错误；")
-    print("返回 code=0 或参数校验类错误（如缺少必填参数）= 路径正确。")
+    print("\n判断标准：返回『服务不存在/路由不存在』= 路径错误；")
+    print("返回 code=0 或参数校验类错误（如 SPU 不存在、缺少必填参数）= 路径正确。")
 
 
 if __name__ == "__main__":
