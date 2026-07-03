@@ -10,6 +10,7 @@
   2. SPU 已存在时，先读详情并合并已有 sku_list，避免编辑语义为全量替换时覆盖老 SKU。
   3. 必须显式传 attribute-json，例如 '[{"pa_id":340,"pai_id":3909}]'。
   4. 默认只预览；必须加 --confirm 才写领星。
+  5. 长任务会按时间自动刷新 token；疑似 token 过期时会刷新后重试当前 SKU 一次。
 
 示例：
   python scripts/apply_lx_spu_service_from_sku_prefix.py \
@@ -32,6 +33,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show", type=int, default=100, help="预览显示行数")
     parser.add_argument("--attribute-json", required=True, help="sku_list.attribute 的JSON数组，例如 '[{\"pa_id\":340,\"pai_id\":3909}]'")
     parser.add_argument("--delay", type=float, default=0.2, help="每条处理后的等待秒数，默认0.2")
+    parser.add_argument("--token-refresh-seconds", type=int, default=1800, help="长任务token刷新间隔秒数，默认1800秒")
     parser.add_argument("--confirm", action="store_true", help="确认写入领星；不加只预览")
     return parser.parse_args()
 
@@ -80,6 +83,24 @@ def parse_attribute_json(value: str) -> list[dict[str, Any]]:
             raise SystemExit("--attribute-json 每个元素都必须包含非空 pa_id 和 pai_id")
         out.append({"pa_id": pa_id, "pai_id": pai_id})
     return out
+
+
+def looks_like_token_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keywords = [
+        "token",
+        "access_token",
+        "refresh_token",
+        "授权",
+        "鉴权",
+        "认证",
+        "过期",
+        "失效",
+        "无效",
+        "unauthorized",
+        "invalid token",
+    ]
+    return any(k in text for k in keywords)
 
 
 def load_rows(db: Database, skus: list[str] | None, sku_like: str, limit: int) -> list[dict[str, Any]]:
@@ -149,9 +170,20 @@ async def run() -> None:
     client = LingxingClient(db=db, enable_api_log=True)
     service = SpuService(client, db)
     token = (await client.generate_token()).token
+    token_generated_at = time.monotonic()
     counter: Counter = Counter()
 
+    async def refresh_token(reason: str) -> str:
+        nonlocal token_generated_at
+        print(f"[TOKEN] {reason}，重新生成 token ...")
+        new_token = (await client.generate_token()).token
+        token_generated_at = time.monotonic()
+        return new_token
+
     for idx, row in enumerate(rows, 1):
+        if args.token_refresh_seconds > 0 and time.monotonic() - token_generated_at >= args.token_refresh_seconds:
+            token = await refresh_token(f"已运行超过 {args.token_refresh_seconds} 秒")
+
         try:
             result = await service.ensure_spu_and_bind_sku(
                 token,
@@ -165,8 +197,26 @@ async def run() -> None:
             counter[status] += 1
             print(f"[{idx}/{len(rows)}] {row['sku']} -> {row['spu']} {status}")
         except Exception as exc:  # noqa: BLE001
-            counter["failed"] += 1
-            print(f"[{idx}/{len(rows)}] FAILED {row['sku']} -> {row['spu']}: {exc}")
+            if looks_like_token_error(exc):
+                try:
+                    token = await refresh_token(f"检测到疑似 token 异常：{exc}")
+                    result = await service.ensure_spu_and_bind_sku(
+                        token,
+                        spu=row["spu"],
+                        sku=row["sku"],
+                        product_name=row["product_name"],
+                        sku_attribute=attribute,
+                        batch_no=batch_no,
+                    )
+                    status = str(result.get("status") or "success")
+                    counter[status] += 1
+                    print(f"[{idx}/{len(rows)}] {row['sku']} -> {row['spu']} {status} after_token_refresh")
+                except Exception as retry_exc:  # noqa: BLE001
+                    counter["failed"] += 1
+                    print(f"[{idx}/{len(rows)}] FAILED {row['sku']} -> {row['spu']} after_token_refresh: {retry_exc}")
+            else:
+                counter["failed"] += 1
+                print(f"[{idx}/{len(rows)}] FAILED {row['sku']} -> {row['spu']}: {exc}")
         if args.delay > 0:
             await asyncio.sleep(args.delay)
 
