@@ -14,9 +14,8 @@
 2. 文档未说明编辑时 sku_list 是全量替换还是追加，按"全量替换"防御性处理：
    编辑时先读详情，合并已关联 SKU（保留其 attribute）后整体提交，并把
    spu_name/model/unit/status/cid/bid/description 原样带回，避免清空已维护信息。
-3. sku_list>>attribute 标注必填，但官方示例传的是空值占位
-   [{"pa_id": "", "pai_id": ""}]。先尝试 []，若报属性相关错误则自动降级
-   为空值占位重试一次。
+3. sku_list>>attribute 标注必填。实测空数组和空值占位可能返回「非法属性值」，
+   因此正式绑定建议显式传入真实属性值，例如 [{"pa_id":340,"pai_id":3909}]。
 4. 流程与 CategoryService/ProductService 一致：校验 → 查询现状 → 写入 →
    复查 → 落变更日志（lxpm_spu_change_log）。
 """
@@ -62,6 +61,7 @@ class SpuService:
             "未找到该spu" in text
             or "未找到该 spu" in text
             or "未找到spu" in text
+            or "未找到" in text and "spu" in text
             or "spu不存在" in text
             or "spu 不存在" in text
             or "not found" in text
@@ -77,6 +77,22 @@ class SpuService:
         if not SPU_NAME_PATTERN.match(value):
             raise RuntimeError(f"SPU 名称不合法（仅允许数字/字母/横杠/下划线）：{value!r}")
         return value
+
+    @staticmethod
+    def normalize_attribute(attribute: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """只保留 spu/set 需要的 pa_id/pai_id，避免带入 pai_name 等只读字段。"""
+        if not attribute:
+            return []
+        out: list[dict[str, Any]] = []
+        for item in attribute:
+            if not isinstance(item, dict):
+                continue
+            pa_id = item.get("pa_id")
+            pai_id = item.get("pai_id")
+            if pa_id in (None, "") or pai_id in (None, ""):
+                continue
+            out.append({"pa_id": pa_id, "pai_id": pai_id})
+        return out
 
     async def sku_exists(self, token: str, sku: str) -> bool:
         """校验 SKU 在领星是否已存在，防止 spu/set 把拼错的 SKU 自动建成产品。"""
@@ -144,6 +160,7 @@ class SpuService:
         sku: str,
         spu_name: str | None = None,
         product_name: str | None = None,
+        sku_attribute: list[dict[str, Any]] | None = None,
         allow_create_sku: bool = False,
         batch_no: str = "manual",
         task_id: int | None = None,
@@ -159,6 +176,7 @@ class SpuService:
         sku = (sku or "").strip()
         if not sku:
             raise RuntimeError("SKU 为空")
+        normalized_attribute = self.normalize_attribute(sku_attribute)
 
         # 1) SKU 存在性校验（spu/set 会自动创建不存在的 SKU，必须拦）
         if not await self.sku_exists(token, sku):
@@ -178,7 +196,7 @@ class SpuService:
             return {"sku": sku, "spu": spu, "ps_id": (detail or {}).get("ps_id"), "status": "skipped"}
 
         # 3) 构造 body：新 SKU + 已有关联（保留 attribute），编辑时带回标量字段
-        new_entry: dict[str, Any] = {"sku": sku, "attribute": []}
+        new_entry: dict[str, Any] = {"sku": sku, "attribute": normalized_attribute}
         if product_name:
             new_entry["product_name"] = product_name
         body: dict[str, Any] = {
@@ -194,9 +212,9 @@ class SpuService:
                 elif value not in (None, "", 0):
                     body[field] = value
 
-        # 4) 提交；attribute=[] 被拒时降级为空值占位重试一次
+        # 4) 提交。若没有显式属性，才尝试空值占位降级；若传了真实属性，失败就停。
         response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
-        if not self._success(response) and self._looks_like_attribute_error(response):
+        if not self._success(response) and not normalized_attribute and self._looks_like_attribute_error(response):
             for entry in body["sku_list"]:
                 if not entry.get("attribute"):
                     entry["attribute"] = [{"pa_id": "", "pai_id": ""}]
@@ -229,13 +247,14 @@ class SpuService:
         token: str,
         pairs: list[tuple[str, str]],
         batch_no: str,
+        sku_attribute: list[dict[str, Any]] | None = None,
     ) -> dict[str, list[str]]:
         """批量绑定 [(sku, spu), ...]。逐条处理、单条失败不阻断整批。"""
         summary: dict[str, list[str]] = {"success": [], "skipped": [], "failed": []}
         for sku, spu in pairs:
             try:
                 result = await self.ensure_spu_and_bind_sku(
-                    token, spu=spu, sku=sku, batch_no=batch_no
+                    token, spu=spu, sku=sku, batch_no=batch_no, sku_attribute=sku_attribute
                 )
                 summary["skipped" if result["status"] == "skipped" else "success"].append(sku)
             except Exception as exc:
@@ -257,7 +276,10 @@ class SpuService:
             attribute = []
             for attr in item.get("attribute") or []:
                 if isinstance(attr, dict):
-                    attribute.append({"pa_id": attr.get("pa_id"), "pai_id": attr.get("pai_id")})
+                    pa_id = attr.get("pa_id")
+                    pai_id = attr.get("pai_id")
+                    if pa_id not in (None, "") and pai_id not in (None, ""):
+                        attribute.append({"pa_id": pa_id, "pai_id": pai_id})
             entries.append({"sku": sku, "attribute": attribute})
         return entries
 
