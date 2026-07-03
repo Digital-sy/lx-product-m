@@ -51,6 +51,22 @@ class SpuService:
     def _success(result: dict[str, Any]) -> bool:
         return str(result.get("code")) == "0"
 
+    @staticmethod
+    def _is_spu_not_found(result: dict[str, Any]) -> bool:
+        """领星 spu/info 对不存在 SPU 会返回 code=500 + error_details=未找到该spu。"""
+        text = " ".join(
+            str(result.get(key) or "")
+            for key in ("message", "msg", "error_details")
+        ).lower()
+        return (
+            "未找到该spu" in text
+            or "未找到该 spu" in text
+            or "未找到spu" in text
+            or "spu不存在" in text
+            or "spu 不存在" in text
+            or "not found" in text
+        )
+
     # ------------------------------------------------------------------ 校验
 
     @staticmethod
@@ -113,9 +129,7 @@ class SpuService:
             body["spu"] = spu
         result = await self.client.request(token, SPU_INFO_API, "POST", req_body=body)
         if not self._success(result):
-            msg = str(result.get("message") or result.get("msg") or "")
-            details = str(result.get("error_details") or "")
-            if "不存在" in msg or "不存在" in details:
+            if self._is_spu_not_found(result):
                 return None
             raise RuntimeError(f"查询多属性产品详情失败：{result}")
         data = result.get("data")
@@ -155,7 +169,7 @@ class SpuService:
             if not product_name:
                 raise RuntimeError(f"SKU {sku} 不存在且未提供 product_name，无法自动创建")
 
-        # 2) 查询 SPU 现状
+        # 2) 查询 SPU 现状；不存在时 detail=None，后续走新建
         detail = await self.get_spu_detail(token, spu=spu)
         existing_entries = self._extract_sku_entries(detail)
         if any(entry["sku"] == sku for entry in existing_entries):
