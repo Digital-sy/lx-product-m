@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""领星 SPU（多属性产品）服务。
-
-接口（来自官方开放接口文档）：
-    查询多属性产品列表  POST /erp/sc/routing/storage/spu/spuList   （令牌桶 1，length 上限 200）
-    查询多属性产品详情  POST /erp/sc/routing/storage/spu/info      （令牌桶 1，ps_id 与 spu 二选一）
-    添加/编辑多属性产品 POST /erp/sc/routing/storage/spu/set       （令牌桶 5）
-
-设计要点：
-1. spu/set 的 sku_list 中"提交的 sku 不存在时系统会自动创建"——为防止把
-   拼错的 SKU 凭空建成产品，绑定前默认先经 batchGetProductInfo 校验 SKU
-   存在（allow_create_sku=False）。
-2. 文档未说明编辑时 sku_list 是全量替换还是追加，按"全量替换"防御性处理：
-   编辑时先读详情，合并已关联 SKU（保留其 attribute）后整体提交，并把
-   spu_name/model/unit/status/cid/bid/description 原样带回，避免清空已维护信息。
-3. sku_list>>attribute 标注必填。实测空数组和空值占位可能返回「非法属性值」，
-   因此正式绑定建议显式传入真实属性值，例如 [{"pa_id":340,"pai_id":3909}]。
-4. 流程与 CategoryService/ProductService 一致：校验 → 查询现状 → 写入 →
-   复查 → 落变更日志（lxpm_spu_change_log）。
-"""
+"""领星 SPU（多属性产品）服务。"""
 from __future__ import annotations
 
 import asyncio
@@ -34,10 +16,8 @@ SPU_INFO_API = "/erp/sc/routing/storage/spu/info"
 SPU_SET_API = "/erp/sc/routing/storage/spu/set"
 PRODUCT_DETAIL_API = "/erp/sc/routing/data/local_inventory/batchGetProductInfo"
 
-# SPU 名称仅允许 数字、字母、横杠、下划线
 SPU_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-
-# 编辑时需要原样带回的 SPU 标量字段（防止被默认值覆盖）
+_ALREADY_BOUND_RE = re.compile(r"SKU-([^\s]+?)当前已经关联")
 _CARRY_OVER_FIELDS = ("spu_name", "model", "unit", "status", "cid", "bid", "description")
 
 
@@ -52,11 +32,7 @@ class SpuService:
 
     @staticmethod
     def _is_spu_not_found(result: dict[str, Any]) -> bool:
-        """领星 spu/info 对不存在 SPU 会返回 code=500 + error_details=未找到该spu。"""
-        text = " ".join(
-            str(result.get(key) or "")
-            for key in ("message", "msg", "error_details")
-        ).lower()
+        text = " ".join(str(result.get(key) or "") for key in ("message", "msg", "error_details")).lower()
         return (
             "未找到该spu" in text
             or "未找到该 spu" in text
@@ -66,8 +42,6 @@ class SpuService:
             or "spu 不存在" in text
             or "not found" in text
         )
-
-    # ------------------------------------------------------------------ 校验
 
     @staticmethod
     def validate_spu_name(spu: str) -> str:
@@ -80,7 +54,6 @@ class SpuService:
 
     @staticmethod
     def normalize_attribute(attribute: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-        """只保留 spu/set 需要的 pa_id/pai_id，避免带入 pai_name 等只读字段。"""
         if not attribute:
             return []
         out: list[dict[str, Any]] = []
@@ -95,10 +68,7 @@ class SpuService:
         return out
 
     async def sku_exists(self, token: str, sku: str) -> bool:
-        """校验 SKU 在领星是否已存在，防止 spu/set 把拼错的 SKU 自动建成产品。"""
-        result = await self.client.request(
-            token, PRODUCT_DETAIL_API, "POST", req_body={"skus": [sku]}
-        )
+        result = await self.client.request(token, PRODUCT_DETAIL_API, "POST", req_body={"skus": [sku]})
         if not self._success(result):
             raise RuntimeError(f"校验 SKU 是否存在失败：{result}")
         for item in result.get("data") or []:
@@ -106,10 +76,30 @@ class SpuService:
                 return True
         return False
 
-    # ------------------------------------------------------------------ 读取
+    async def batch_sku_exists(self, token: str, skus: list[str]) -> set[str]:
+        """批量校验 SKU 是否存在，batchGetProductInfo 一次最多按 100 个 SKU 请求。"""
+        clean = []
+        seen = set()
+        for sku in skus:
+            value = (sku or "").strip()
+            if value and value not in seen:
+                clean.append(value)
+                seen.add(value)
+        exists: set[str] = set()
+        for i in range(0, len(clean), 100):
+            batch = clean[i:i + 100]
+            result = await self.client.request(token, PRODUCT_DETAIL_API, "POST", req_body={"skus": batch})
+            if not self._success(result):
+                raise RuntimeError(f"批量校验 SKU 是否存在失败：{result}")
+            for item in result.get("data") or []:
+                sku = str(item.get("sku") or item.get("SKU") or "").strip()
+                if sku:
+                    exists.add(sku)
+            if settings.collection_delay_seconds > 0 and i + 100 < len(clean):
+                await asyncio.sleep(settings.collection_delay_seconds)
+        return exists
 
     async def fetch_spu_list(self, token: str, page_size: int = 200) -> list[dict[str, Any]]:
-        """分页拉取多属性产品列表（length 上限 200，令牌桶 1，注意限速）。"""
         rows: list[dict[str, Any]] = []
         offset = 0
         page_size = max(1, min(page_size, 200))
@@ -129,13 +119,7 @@ class SpuService:
             await asyncio.sleep(max(settings.collection_delay_seconds, 1.0))
         return rows
 
-    async def get_spu_detail(
-        self,
-        token: str,
-        spu: str | None = None,
-        ps_id: int | None = None,
-    ) -> dict[str, Any] | None:
-        """查询单个 SPU 详情。不存在时返回 None。"""
+    async def get_spu_detail(self, token: str, spu: str | None = None, ps_id: int | None = None) -> dict[str, Any] | None:
         if not spu and not ps_id:
             raise RuntimeError("get_spu_detail 需要提供 spu 或 ps_id")
         body: dict[str, Any] = {}
@@ -151,8 +135,6 @@ class SpuService:
         data = result.get("data")
         return data if data else None
 
-    # ------------------------------------------------------------------ 写入
-
     async def ensure_spu_and_bind_sku(
         self,
         token: str,
@@ -165,82 +147,162 @@ class SpuService:
         batch_no: str = "manual",
         task_id: int | None = None,
     ) -> dict[str, Any]:
-        """确保 SPU 存在并把 SKU 关联到其下，写入后复查。
+        result = await self.ensure_spu_and_bind_skus(
+            token,
+            spu=spu,
+            sku_rows=[{"sku": sku, "product_name": product_name or ""}],
+            spu_name=spu_name,
+            sku_attribute=sku_attribute,
+            allow_create_sku=allow_create_sku,
+            batch_no=batch_no,
+            task_id=task_id,
+        )
+        status = "success"
+        if sku in result.get("skipped", []):
+            status = "skipped"
+        elif sku in result.get("blocked", []):
+            raise RuntimeError(f"SKU 在领星不存在：{sku}")
+        elif sku in result.get("failed", []):
+            raise RuntimeError(f"SPU 绑定失败：{sku} -> {spu}")
+        elif sku in result.get("verify_failed", []):
+            raise RuntimeError(f"SPU 写入接口成功，但复查未发现 SKU 关联：{sku}")
+        elif sku in result.get("skipped_already_bound", []):
+            status = "skipped_already_bound"
+        return {"sku": sku, "spu": spu, "status": status, "spu_sku_count": result.get("spu_sku_count", 0)}
 
-        - SPU 不存在 → 新建（spu_name 缺省用 spu 本身）；
-        - SPU 已存在 → 合并已有关联后整体提交（视为全量替换的防御性写法）；
-        - SKU 已关联 → 跳过；
-        - SKU 在领星不存在且 allow_create_sku=False → 报错拦截，防止误建产品。
+    async def ensure_spu_and_bind_skus(
+        self,
+        token: str,
+        spu: str,
+        sku_rows: list[dict[str, Any]],
+        spu_name: str | None = None,
+        sku_attribute: list[dict[str, Any]] | None = None,
+        allow_create_sku: bool = False,
+        batch_no: str = "manual",
+        task_id: int | None = None,
+    ) -> dict[str, Any]:
+        """同一个 SPU 下多 SKU 合并绑定。
+
+        将同 SPU 的多个 SKU 合成一次 spu/set，避免逐个 SKU 重复执行
+        sku_exists -> spu/info -> spu/set -> verify。
         """
         spu = self.validate_spu_name(spu)
-        sku = (sku or "").strip()
-        if not sku:
-            raise RuntimeError("SKU 为空")
         normalized_attribute = self.normalize_attribute(sku_attribute)
+        summary: dict[str, Any] = {
+            "success": [],
+            "skipped": [],
+            "blocked": [],
+            "failed": [],
+            "verify_failed": [],
+            "skipped_already_bound": [],
+            "spu_sku_count": 0,
+        }
+        rows: list[dict[str, Any]] = []
+        seen = set()
+        for row in sku_rows:
+            sku = str(row.get("sku") or "").strip()
+            if not sku or sku in seen:
+                continue
+            seen.add(sku)
+            rows.append({"sku": sku, "product_name": str(row.get("product_name") or "").strip()})
+        if not rows:
+            return summary
 
-        # 1) SKU 存在性校验（spu/set 会自动创建不存在的 SKU，必须拦）
-        if not await self.sku_exists(token, sku):
-            if not allow_create_sku:
-                err = f"SKU 在领星不存在：{sku}（如需借 spu/set 自动创建请显式传 allow_create_sku=True 并提供 product_name）"
-                self._write_change_log(batch_no, task_id, sku, spu, "blocked", None, None, None, err)
-                raise RuntimeError(err)
-            if not product_name:
-                raise RuntimeError(f"SKU {sku} 不存在且未提供 product_name，无法自动创建")
+        if not allow_create_sku:
+            existing_skus = await self.batch_sku_exists(token, [r["sku"] for r in rows])
+            active_rows = []
+            for row in rows:
+                if row["sku"] in existing_skus:
+                    active_rows.append(row)
+                else:
+                    err = f"SKU 在领星不存在：{row['sku']}"
+                    self._write_change_log(batch_no, task_id, row["sku"], spu, "blocked", None, None, None, err)
+                    summary["blocked"].append(row["sku"])
+            rows = active_rows
+            if not rows:
+                return summary
 
-        # 2) 查询 SPU 现状；不存在时 detail=None，后续走新建
         detail = await self.get_spu_detail(token, spu=spu)
         existing_entries = self._extract_sku_entries(detail)
-        if any(entry["sku"] == sku for entry in existing_entries):
-            self._write_change_log(batch_no, task_id, sku, spu, "skipped",
-                                   None, None, None, "SKU 已在该 SPU 下，跳过")
-            return {"sku": sku, "spu": spu, "ps_id": (detail or {}).get("ps_id"), "status": "skipped"}
+        existing_set = {entry["sku"] for entry in existing_entries}
+        pending_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if row["sku"] in existing_set:
+                self._write_change_log(batch_no, task_id, row["sku"], spu, "skipped", None, None, None, "SKU 已在该 SPU 下，跳过")
+                summary["skipped"].append(row["sku"])
+            else:
+                pending_rows.append(row)
 
-        # 3) 构造 body：新 SKU + 已有关联（保留 attribute），编辑时带回标量字段
-        new_entry: dict[str, Any] = {"sku": sku, "attribute": normalized_attribute}
-        if product_name:
-            new_entry["product_name"] = product_name
-        body: dict[str, Any] = {
-            "spu": spu,
-            "spu_name": (spu_name or spu),
-            "sku_list": existing_entries + [new_entry],
-        }
-        if detail:
-            for field in _CARRY_OVER_FIELDS:
-                value = detail.get(field)
-                if field == "spu_name":
-                    body["spu_name"] = str(value or spu_name or spu)
-                elif value not in (None, "", 0):
-                    body[field] = value
+        if not pending_rows:
+            summary["spu_sku_count"] = len(existing_entries)
+            return summary
 
-        # 4) 提交。若没有显式属性，才尝试空值占位降级；若传了真实属性，失败就停。
-        response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
-        if not self._success(response) and not normalized_attribute and self._looks_like_attribute_error(response):
-            for entry in body["sku_list"]:
-                if not entry.get("attribute"):
-                    entry["attribute"] = [{"pa_id": "", "pai_id": ""}]
+        while pending_rows:
+            new_entries = []
+            for row in pending_rows:
+                entry: dict[str, Any] = {"sku": row["sku"], "attribute": normalized_attribute}
+                if row.get("product_name"):
+                    entry["product_name"] = row["product_name"]
+                new_entries.append(entry)
+
+            body: dict[str, Any] = {
+                "spu": spu,
+                "spu_name": (spu_name or spu),
+                "sku_list": existing_entries + new_entries,
+            }
+            if detail:
+                for field in _CARRY_OVER_FIELDS:
+                    value = detail.get(field)
+                    if field == "spu_name":
+                        body["spu_name"] = str(value or spu_name or spu)
+                    elif value not in (None, "", 0):
+                        body[field] = value
+
             response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
-        if not self._success(response):
-            self._write_change_log(batch_no, task_id, sku, spu, "failed",
-                                   body, response, None, str(response))
-            raise RuntimeError(f"SPU 写入失败：{response}")
+            if not self._success(response) and not normalized_attribute and self._looks_like_attribute_error(response):
+                for entry in body["sku_list"]:
+                    if not entry.get("attribute"):
+                        entry["attribute"] = [{"pa_id": "", "pai_id": ""}]
+                response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
 
-        # 5) 复查
-        await asyncio.sleep(settings.collection_delay_seconds)
+            if self._success(response):
+                break
+
+            already_bound_sku = self._extract_already_bound_sku(response)
+            if already_bound_sku:
+                removed = False
+                next_pending = []
+                for row in pending_rows:
+                    if row["sku"] == already_bound_sku:
+                        self._write_change_log(batch_no, task_id, row["sku"], spu, "skipped_already_bound", body, response, None, str(response))
+                        summary["skipped_already_bound"].append(row["sku"])
+                        removed = True
+                    else:
+                        next_pending.append(row)
+                pending_rows = next_pending
+                if removed and pending_rows:
+                    continue
+                if removed and not pending_rows:
+                    return summary
+
+            for row in pending_rows:
+                self._write_change_log(batch_no, task_id, row["sku"], spu, "failed", body, response, None, str(response))
+                summary["failed"].append(row["sku"])
+            return summary
+
+        if settings.collection_delay_seconds > 0:
+            await asyncio.sleep(settings.collection_delay_seconds)
         verify = await self.get_spu_detail(token, spu=spu)
-        verify_skus = [entry["sku"] for entry in self._extract_sku_entries(verify)]
-        ok = sku in verify_skus
-        status = "success" if ok else "verify_failed"
-        err = "" if ok else "写入接口成功，但复查未发现 SKU 关联"
-        self._write_change_log(batch_no, task_id, sku, spu, status, body, response, verify, err)
-        if not ok:
-            raise RuntimeError(err)
-        return {
-            "sku": sku,
-            "spu": spu,
-            "ps_id": (verify or {}).get("ps_id"),
-            "status": status,
-            "spu_sku_count": len(verify_skus),
-        }
+        verify_entries = self._extract_sku_entries(verify)
+        verify_skus = {entry["sku"] for entry in verify_entries}
+        summary["spu_sku_count"] = len(verify_skus)
+        for row in pending_rows:
+            ok = row["sku"] in verify_skus
+            status = "success" if ok else "verify_failed"
+            err = "" if ok else "写入接口成功，但复查未发现 SKU 关联"
+            self._write_change_log(batch_no, task_id, row["sku"], spu, status, body, response, verify, err)
+            summary[status].append(row["sku"])
+        return summary
 
     async def bind_batch(
         self,
@@ -249,25 +311,33 @@ class SpuService:
         batch_no: str,
         sku_attribute: list[dict[str, Any]] | None = None,
     ) -> dict[str, list[str]]:
-        """批量绑定 [(sku, spu), ...]。逐条处理、单条失败不阻断整批。"""
         summary: dict[str, list[str]] = {"success": [], "skipped": [], "failed": []}
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for sku, spu in pairs:
+            grouped.setdefault(spu, []).append({"sku": sku, "product_name": ""})
+        for spu, rows in grouped.items():
             try:
-                result = await self.ensure_spu_and_bind_sku(
-                    token, spu=spu, sku=sku, batch_no=batch_no, sku_attribute=sku_attribute
+                result = await self.ensure_spu_and_bind_skus(
+                    token, spu=spu, sku_rows=rows, batch_no=batch_no, sku_attribute=sku_attribute
                 )
-                summary["skipped" if result["status"] == "skipped" else "success"].append(sku)
+                for status, skus in result.items():
+                    if not isinstance(skus, list):
+                        continue
+                    if status == "success":
+                        summary["success"].extend(skus)
+                    elif status == "skipped":
+                        summary["skipped"].extend(skus)
+                    elif status in ("failed", "blocked", "verify_failed"):
+                        summary["failed"].extend(skus)
             except Exception as exc:
-                print(f"[FAILED] sku={sku} spu={spu}: {exc}")
-                summary["failed"].append(sku)
-            await asyncio.sleep(settings.collection_delay_seconds)
+                print(f"[FAILED] spu={spu}: {exc}")
+                summary["failed"].extend([str(r.get("sku") or "") for r in rows])
+            if settings.collection_delay_seconds > 0:
+                await asyncio.sleep(settings.collection_delay_seconds)
         return summary
-
-    # ------------------------------------------------------------------ 辅助
 
     @staticmethod
     def _extract_sku_entries(detail: dict[str, Any] | None) -> list[dict[str, Any]]:
-        """从详情提取已关联 SKU 及其 attribute（剔除 pai_name 等只读字段）。"""
         entries: list[dict[str, Any]] = []
         for item in (detail or {}).get("sku_list") or []:
             sku = str(item.get("sku") or "").strip()
@@ -287,6 +357,12 @@ class SpuService:
     def _looks_like_attribute_error(result: dict[str, Any]) -> bool:
         text = str(result.get("message") or "") + str(result.get("error_details") or "")
         return ("attribute" in text.lower()) or ("属性" in text)
+
+    @staticmethod
+    def _extract_already_bound_sku(result: dict[str, Any]) -> str:
+        text = " ".join(str(result.get(key) or "") for key in ("message", "msg", "error_details"))
+        m = _ALREADY_BOUND_RE.search(text)
+        return m.group(1).strip() if m else ""
 
     def _write_change_log(
         self,
@@ -308,8 +384,7 @@ class SpuService:
                  `request_json`, `response_json`, `verify_response_json`, `error_message`)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (batch_no, task_id, sku, spu, status,
-                 json_dumps(req), json_dumps(resp), json_dumps(verify_resp), err[:1000]),
+                (batch_no, task_id, sku, spu, status, json_dumps(req), json_dumps(resp), json_dumps(verify_resp), err[:1000]),
             )
 
 
