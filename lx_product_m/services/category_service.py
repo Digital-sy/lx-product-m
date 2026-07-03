@@ -54,7 +54,8 @@ class CategoryService:
             offset += page_size
             if total and offset >= total:
                 break
-            await asyncio.sleep(settings.collection_delay_seconds)
+            if settings.collection_delay_seconds > 0:
+                await asyncio.sleep(settings.collection_delay_seconds)
 
         return all_rows
 
@@ -91,28 +92,31 @@ class CategoryService:
             parent_path, parent_level = build_path(parent, seen)
             return f"{parent_path}/{row['title']}", parent_level + 1
 
-        with self.db.cursor() as cur:
-            for cid, row in normalized.items():
-                full_path, level_no = build_path(cid)
-                is_leaf = 0 if cid in child_parent_set else 1
-                cur.execute(
-                    """
-                    REPLACE INTO `lxpm_category`
-                    (`cid`, `parent_cid`, `title`, `category_code`, `full_path`, `level_no`,
-                     `is_leaf`, `raw_json`, `synced_at`)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                    """,
-                    (
-                        row["cid"],
-                        row["parent_cid"],
-                        row["title"],
-                        row["category_code"],
-                        full_path,
-                        level_no,
-                        is_leaf,
-                        json_dumps(row["raw_json"]),
-                    ),
-                )
+        params: list[tuple[Any, ...]] = []
+        for cid, row in normalized.items():
+            full_path, level_no = build_path(cid)
+            is_leaf = 0 if cid in child_parent_set else 1
+            params.append((
+                row["cid"],
+                row["parent_cid"],
+                row["title"],
+                row["category_code"],
+                full_path,
+                level_no,
+                is_leaf,
+                json_dumps(row["raw_json"]),
+            ))
+
+        self.db.executemany(
+            """
+            REPLACE INTO `lxpm_category`
+            (`cid`, `parent_cid`, `title`, `category_code`, `full_path`, `level_no`,
+             `is_leaf`, `raw_json`, `synced_at`)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            """,
+            params,
+            batch_size=1000,
+        )
         return len(normalized)
 
     def get_category_by_id(self, cid: int) -> dict[str, Any] | None:
