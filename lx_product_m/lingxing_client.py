@@ -36,22 +36,30 @@ class LingxingClient:
         self.timeout = httpx.Timeout(settings.api_timeout_seconds, connect=15)
         self.db = db
         self.enable_api_log = enable_api_log
+        self._http: httpx.AsyncClient | None = None
 
     async def _client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {"timeout": self.timeout}
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
-        return httpx.AsyncClient(**kwargs)
+        """复用 httpx.AsyncClient，保留 keep-alive 连接。"""
+        if self._http is None or self._http.is_closed:
+            kwargs: dict[str, Any] = {"timeout": self.timeout}
+            if self.proxy_url:
+                kwargs["proxy"] = self.proxy_url
+            self._http = httpx.AsyncClient(**kwargs)
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
 
     async def generate_token(self) -> AccessToken:
         url = self.host + "/api/auth-server/oauth/access-token"
         data = {APP_ID_FIELD: self.app_id, APP_SECRET_FIELD: self.app_secret}
-        async with await self._client() as client:
-            resp = await client.post(
-                url,
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+        client = await self._client()
+        resp = await client.post(
+            url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         payload = resp.json()
         if str(payload.get("code")) != "200":
             raise RuntimeError(f"获取领星令牌失败：{payload}")
@@ -93,14 +101,14 @@ class LingxingClient:
         response_payload: dict[str, Any] | None = None
         error_message = ""
         try:
-            async with await self._client() as client:
-                resp = await client.request(
-                    method,
-                    url,
-                    params=req_params,
-                    json=req_body if req_body else None,
-                    headers={"Content-Type": "application/json"} if req_body else None,
-                )
+            client = await self._client()
+            resp = await client.request(
+                method,
+                url,
+                params=req_params,
+                json=req_body if req_body else None,
+                headers={"Content-Type": "application/json"} if req_body else None,
+            )
             response_payload = resp.json()
             return response_payload
         except Exception as exc:
