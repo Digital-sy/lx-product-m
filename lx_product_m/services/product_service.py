@@ -15,16 +15,36 @@ PRODUCT_DETAIL_API = "/erp/sc/routing/data/local_inventory/batchGetProductInfo"
 PRODUCT_LIST_API = "/erp/sc/routing/data/local_inventory/productList"
 PRODUCT_SET_API = "/erp/sc/routing/storage/product/set"
 
+SNAPSHOT_REPLACE_SQL = """
+REPLACE INTO `lxpm_product_category_snapshot`
+(`sku`, `product_name`, `category_id`, `category_name`, `category_path`, `spu`,
+ `custom_fields_json`, `raw_json`, `last_api_code`, `last_api_message`, `synced_at`)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+"""
+
 
 class ProductService:
     def __init__(self, client: LingxingClient, db: Database) -> None:
         self.client = client
         self.db = db
         self.category_service = CategoryService(client, db)
+        self._category_cache: dict[int, dict[str, Any]] | None = None
 
     @staticmethod
     def _success(result: dict[str, Any]) -> bool:
         return str(result.get("code")) == "0"
+
+    def _get_category_cached(self, cid: int) -> dict[str, Any] | None:
+        if self._category_cache is None:
+            rows = self.db.fetch_all("SELECT * FROM `lxpm_category`")
+            cache: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                try:
+                    cache[int(row.get("cid"))] = row
+                except Exception:
+                    continue
+            self._category_cache = cache
+        return self._category_cache.get(cid)
 
     async def fetch_product_list(
         self,
@@ -53,13 +73,15 @@ class ProductService:
             if max_pages and page_no >= max_pages:
                 break
             offset += page_size
-            await asyncio.sleep(settings.collection_delay_seconds)
+            if settings.collection_delay_seconds > 0:
+                await asyncio.sleep(settings.collection_delay_seconds)
         return rows
 
     async def batch_get_product_info(self, token: str, skus: list[str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for i in range(0, len(skus), 100):
-            batch = [x.strip() for x in skus[i:i + 100] if x and x.strip()]
+        clean_skus = [x.strip() for x in skus if x and x.strip()]
+        for i in range(0, len(clean_skus), 100):
+            batch = clean_skus[i:i + 100]
             if not batch:
                 continue
             result = await self.client.request(
@@ -70,7 +92,8 @@ class ProductService:
                     self.save_product_snapshot_from_error(sku, result)
                 raise RuntimeError(f"查询产品详情失败：{result}")
             rows.extend(result.get("data") or [])
-            await asyncio.sleep(settings.collection_delay_seconds)
+            if settings.collection_delay_seconds > 0 and i + 100 < len(clean_skus):
+                await asyncio.sleep(settings.collection_delay_seconds)
         return rows
 
     def extract_custom_fields(self, product: dict[str, Any]) -> list[dict[str, Any]]:
@@ -101,39 +124,42 @@ class ProductService:
         ).strip()
         return cid, title
 
-    def save_product_snapshot(self, product: dict[str, Any]) -> None:
+    def build_product_snapshot_params(self, product: dict[str, Any]) -> tuple[Any, ...] | None:
         sku = str(product.get("sku") or product.get("SKU") or "").strip()
         if not sku:
-            return
+            return None
         product_name = str(product.get("product_name") or product.get("productName") or "").strip()
         cid, title = self.extract_category(product)
         path = ""
         if cid:
-            cat = self.category_service.get_category_by_id(cid)
+            cat = self._get_category_cached(cid)
             if cat:
                 title = title or str(cat.get("title") or "")
                 path = str(cat.get("full_path") or "")
-        with self.db.cursor() as cur:
-            cur.execute(
-                """
-                REPLACE INTO `lxpm_product_category_snapshot`
-                (`sku`, `product_name`, `category_id`, `category_name`, `category_path`, `spu`,
-                 `custom_fields_json`, `raw_json`, `last_api_code`, `last_api_message`, `synced_at`)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                """,
-                (
-                    sku,
-                    product_name,
-                    cid,
-                    title,
-                    path,
-                    extract_spu(sku),
-                    json_dumps(self.extract_custom_fields(product)),
-                    json_dumps(product),
-                    0,
-                    "success",
-                ),
-            )
+        return (
+            sku,
+            product_name,
+            cid,
+            title,
+            path,
+            extract_spu(sku),
+            json_dumps(self.extract_custom_fields(product)),
+            json_dumps(product),
+            0,
+            "success",
+        )
+
+    def save_product_snapshot(self, product: dict[str, Any]) -> None:
+        params = self.build_product_snapshot_params(product)
+        if not params:
+            return
+        self.db.execute(SNAPSHOT_REPLACE_SQL, params)
+
+    def save_product_snapshots(self, products: list[dict[str, Any]], batch_size: int = 1000) -> int:
+        params = [p for p in (self.build_product_snapshot_params(product) for product in products) if p]
+        if not params:
+            return 0
+        return self.db.executemany(SNAPSHOT_REPLACE_SQL, params, batch_size=batch_size)
 
     def save_product_snapshot_from_error(self, sku: str, result: dict[str, Any]) -> None:
         with self.db.cursor() as cur:
@@ -148,14 +174,12 @@ class ProductService:
 
     async def query_and_save(self, token: str, skus: list[str]) -> list[dict[str, Any]]:
         products = await self.batch_get_product_info(token, skus)
-        for product in products:
-            self.save_product_snapshot(product)
+        self.save_product_snapshots(products)
         return products
 
     async def sync_product_list_snapshot(self, token: str, page_size: int = 1000, max_pages: int = 0) -> int:
         products = await self.fetch_product_list(token, page_size=page_size, max_pages=max_pages)
-        for product in products:
-            self.save_product_snapshot(product)
+        self.save_product_snapshots(products)
         return len(products)
 
     def resolve_target_category(self, category_id: int | None = None, category_name: str | None = None) -> dict[str, Any]:
