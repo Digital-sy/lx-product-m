@@ -21,14 +21,24 @@ class FeishuBitableClient:
         self.view_id = view_id
         self._tenant_token: str | None = None
         self.timeout = httpx.Timeout(settings.api_timeout_seconds, connect=15)
+        self._http: httpx.AsyncClient | None = None
+
+    async def _client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=self.timeout)
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
 
     async def get_tenant_token(self) -> str:
         if self._tenant_token:
             return self._tenant_token
         url = f"{self.api_base}/auth/v3/tenant_access_token/internal"
         body = {"app_id": self.app_id, "app_secret": self.app_secret}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=body, headers={"Content-Type": "application/json; charset=utf-8"})
+        client = await self._client()
+        resp = await client.post(url, json=body, headers={"Content-Type": "application/json; charset=utf-8"})
         result = resp.json()
         if result.get("code") != 0:
             raise RuntimeError(f"获取飞书 tenant_access_token 失败：{result}")
@@ -46,8 +56,8 @@ class FeishuBitableClient:
 
     async def list_fields(self) -> list[dict[str, Any]]:
         url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/fields"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, headers=await self._headers())
+        client = await self._client()
+        resp = await client.get(url, headers=await self._headers())
         result = resp.json()
         if result.get("code") != 0:
             raise RuntimeError(f"获取飞书字段失败：{result}")
@@ -57,6 +67,7 @@ class FeishuBitableClient:
         rows: list[dict[str, Any]] = []
         page_token: str | None = None
         page_size = max(1, min(page_size, 500))
+        client = await self._client()
         while True:
             url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records"
             params: dict[str, Any] = {"page_size": page_size}
@@ -64,8 +75,7 @@ class FeishuBitableClient:
                 params["view_id"] = self.view_id
             if page_token:
                 params["page_token"] = page_token
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(url, headers=await self._headers(), params=params)
+            resp = await client.get(url, headers=await self._headers(), params=params)
             result = resp.json()
             if result.get("code") != 0:
                 raise RuntimeError(f"读取飞书记录失败：{result}")
