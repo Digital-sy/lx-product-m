@@ -18,7 +18,7 @@ from typing import Any
 
 from lx_product_m.db import Database
 from lx_product_m.lingxing_client import LingxingClient
-from lx_product_m.services.product_service import ProductService
+from lx_product_m.services.product_service import PRODUCT_DETAIL_API, ProductService
 
 KEYWORDS = (
     "tag",
@@ -40,6 +40,28 @@ def print_value(title: str, value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
+def is_retryable(resp: dict[str, Any]) -> bool:
+    code = str(resp.get("code"))
+    msg = str(resp.get("msg") or resp.get("message") or "").lower()
+    return code in {"3001008", "500", "502", "503", "504"} or "too frequently" in msg or "稍后再试" in msg
+
+
+async def fetch_product_with_retry(client: LingxingClient, token: str, sku: str, max_retries: int = 6) -> list[dict[str, Any]]:
+    last_resp: dict[str, Any] = {}
+    for attempt in range(max_retries + 1):
+        resp = await client.request(token, PRODUCT_DETAIL_API, "POST", req_body={"skus": [sku]})
+        last_resp = resp
+        if str(resp.get("code")) == "0":
+            return resp.get("data") or []
+        if is_retryable(resp) and attempt < max_retries:
+            wait_s = min(60, 5 * (attempt + 1))
+            print(f"接口频率限制/临时异常，{wait_s}s 后重试：{resp}")
+            await asyncio.sleep(wait_s)
+            continue
+        raise RuntimeError(f"查询产品详情失败：{resp}")
+    raise RuntimeError(f"查询产品详情失败：{last_resp}")
+
+
 async def main() -> None:
     if len(sys.argv) < 2:
         print("用法: python probe_lx_product_custom_labels.py <SKU>")
@@ -51,7 +73,7 @@ async def main() -> None:
     service = ProductService(client, db)
     token = (await client.generate_token()).token
 
-    rows = await service.batch_get_product_info(token, [sku])
+    rows = await fetch_product_with_retry(client, token, sku)
     if not rows:
         print(f"未查询到SKU：{sku}")
         return
