@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -23,9 +23,18 @@ class Database:
     def __init__(self) -> None:
         settings.validate_db()
         self.config = settings.db_config
+        self._conn = None
 
     def connect(self):
-        return pymysql.connect(**self.config, cursorclass=DictCursor)
+        """复用单个 MySQL 长连接，避免每次 SQL 都重新握手/认证。"""
+        if self._conn is None:
+            self._conn = pymysql.connect(**self.config, cursorclass=DictCursor)
+        else:
+            try:
+                self._conn.ping(reconnect=True)
+            except Exception:
+                self._conn = pymysql.connect(**self.config, cursorclass=DictCursor)
+        return self._conn
 
     @contextmanager
     def cursor(self):
@@ -37,13 +46,29 @@ class Database:
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
 
     def execute(self, sql: str, params: Iterable[Any] | None = None) -> int:
         with self.cursor() as cur:
             cur.execute(sql, params or ())
             return cur.rowcount
+
+    def executemany(self, sql: str, params_seq: Sequence[Iterable[Any]], batch_size: int = 1000) -> int:
+        if not params_seq:
+            return 0
+        total = 0
+        with self.cursor() as cur:
+            for i in range(0, len(params_seq), batch_size):
+                batch = params_seq[i : i + batch_size]
+                cur.executemany(sql, batch)
+                total += cur.rowcount
+        return total
 
     def fetch_one(self, sql: str, params: Iterable[Any] | None = None) -> dict | None:
         with self.cursor() as cur:
