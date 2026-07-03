@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show", type=int, default=30, help="预览显示条数")
     p.add_argument("--attribute-json", required=True, help='例如 [{"pa_id":340,"pai_id":3909}]')
     p.add_argument("--delay", type=float, default=0.2, help="每条间隔秒数")
-    p.add_argument("--refresh-seconds", type=int, default=1800, help="访问凭据刷新间隔秒数")
+    p.add_argument("--refresh-seconds", type=int, default=1200, help="访问凭据刷新间隔秒数，默认20分钟")
     p.add_argument("--confirm", action="store_true", help="确认写入；不加只预览")
     return p.parse_args()
 
@@ -107,6 +107,28 @@ def already_bound_error(exc: Exception) -> bool:
     return "当前已经关联" in text or "已经关联了" in text
 
 
+def token_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "2001005" in text
+        or "access token not match" in text
+        or "access_token" in text
+        or "token" in text and ("not match" in text or "invalid" in text or "过期" in text or "失效" in text)
+    )
+
+
+async def bind_one(service: SpuService, token: str, row: dict[str, str], attr: list[dict[str, Any]], batch_no: str) -> str:
+    result = await service.ensure_spu_and_bind_sku(
+        token,
+        spu=row["spu"],
+        sku=row["sku"],
+        product_name=row["product_name"],
+        sku_attribute=attr,
+        batch_no=batch_no,
+    )
+    return str(result.get("status") or "success")
+
+
 async def main() -> None:
     args = parse_args()
     batch_no = args.batch_no or "spu_daily_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -135,25 +157,31 @@ async def main() -> None:
     token_at = time.monotonic()
     counter: Counter[str] = Counter()
 
+    async def refresh_token(reason: str) -> str:
+        nonlocal token_at
+        print(f"[AUTH] {reason}，重新生成 token")
+        new_token = (await client.generate_token()).token
+        token_at = time.monotonic()
+        return new_token
+
     for i, r in enumerate(rows, 1):
         if args.refresh_seconds and time.monotonic() - token_at >= args.refresh_seconds:
-            token = (await client.generate_token()).token
-            token_at = time.monotonic()
-            print("[AUTH] refreshed")
+            token = await refresh_token("定时刷新")
         try:
-            result = await service.ensure_spu_and_bind_sku(
-                token,
-                spu=r["spu"],
-                sku=r["sku"],
-                product_name=r["product_name"],
-                sku_attribute=attr,
-                batch_no=batch_no,
-            )
-            status = str(result.get("status") or "success")
+            status = await bind_one(service, token, r, attr, batch_no)
             counter[status] += 1
             print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} {status}")
         except Exception as exc:  # noqa: BLE001
-            if already_bound_error(exc):
+            if token_error(exc):
+                try:
+                    token = await refresh_token(f"检测到访问凭据异常：{exc}")
+                    status = await bind_one(service, token, r, attr, batch_no)
+                    counter[status] += 1
+                    print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} {status} after_auth_refresh")
+                except Exception as retry_exc:  # noqa: BLE001
+                    counter["failed"] += 1
+                    print(f"[{i}/{len(rows)}] FAILED {r['sku']} -> {r['spu']} after_auth_refresh: {retry_exc}")
+            elif already_bound_error(exc):
                 counter["skipped_already_bound"] += 1
                 print(f"[{i}/{len(rows)}] {r['sku']} -> {r['spu']} skipped_already_bound")
             else:
