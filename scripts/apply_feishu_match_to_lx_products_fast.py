@@ -8,6 +8,7 @@
 3. 支持 --delay 控制每个写入请求之间的间隔，默认 0.05 秒。
 4. 写入过程中遇到 access token 失效会自动重新获取 token 并重试当前 SKU。
 5. 仍然默认只预览，必须加 --confirm 才写领星。
+6. 写分类时会携带快照里的 custom_fields，避免 product/set 覆盖未传字段导致自定义字段丢失。
 
 适合已经全量同步过 lxpm_product_category_snapshot 后使用。
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +57,41 @@ def make_batch_no() -> str:
     return "feishu_fast_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def clean(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def parse_json_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, (list, dict)):
+        return v
+    try:
+        return json.loads(str(v))
+    except Exception:
+        return None
+
+
+def normalize_custom_fields(fields: Any) -> list[dict[str, str]]:
+    """把详情/快照返回的 custom_fields 标准化为 product/set 可写格式。
+
+    领星详情常返回 val_text，写入 product/set 时必须使用 val。
+    """
+    arr = parse_json_value(fields)
+    if not isinstance(arr, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        fid = clean(item.get("id"))
+        name = clean(item.get("name"))
+        val = clean(item.get("val") or item.get("val_text") or item.get("value") or item.get("field_value"))
+        if fid and name and val:
+            out.append({"id": fid, "name": name, "val": val})
+    return out
+
+
 def is_token_error(resp: dict[str, Any] | None) -> bool:
     if not resp:
         return False
@@ -85,6 +122,7 @@ def load_candidate_rows(db: Database, statuses: list[str], style_nos: list[str] 
             p.category_id AS old_category_id,
             p.category_name AS old_category_name,
             p.category_path AS old_category_path,
+            p.custom_fields_json,
             c.title AS target_leaf_name
         FROM `{MATCH_TABLE}` m
         JOIN `{SNAPSHOT_TABLE}` p
@@ -119,19 +157,21 @@ def print_preview(rows: list[dict[str, Any]], show: int, batch_no: str) -> None:
     print("状态分布：" + ", ".join(f"{k}={v}" for k, v in Counter(str(r.get("match_status")) for r in rows).items()))
     print()
     print("--- 明细预览 ---")
-    headers = ["SKU", "款号", "当前分类", "目标分类", "状态", "产品名"]
-    widths = [28, 14, 28, 32, 10, 36]
+    headers = ["SKU", "款号", "当前分类", "目标分类", "状态", "自定义字段", "产品名"]
+    widths = [28, 14, 28, 32, 10, 10, 36]
     print(" ".join(h.ljust(w) for h, w in zip(headers, widths)))
-    print("-" * 160)
+    print("-" * 175)
     for r in rows[:show]:
         current = f"{r.get('old_category_id') or ''} {r.get('old_category_path') or r.get('old_category_name') or ''}"
         target = f"{r.get('target_category_id') or ''} {r.get('target_category_path') or r.get('target_category_name') or ''}"
+        cf_cnt = len(normalize_custom_fields(r.get("custom_fields_json")))
         values = [
             r.get("sku") or "",
             r.get("style_no") or "",
             current,
             target,
             r.get("match_status") or "",
+            str(cf_cnt),
             r.get("product_name") or "",
         ]
         print(" ".join(str(v)[:w].ljust(w) for v, w in zip(values, widths)))
@@ -149,8 +189,10 @@ def insert_tasks(db: Database, batch_no: str, rows: list[dict[str, Any]]) -> lis
     with db.cursor() as cur:
         for r in rows:
             target_name = r.get("target_leaf_name") or r.get("target_category_name") or r.get("target_category_path") or ""
+            cf_cnt = len(normalize_custom_fields(r.get("custom_fields_json")))
             remark = (
-                f"fast=1; style_no={r.get('style_no')}; target_path={r.get('target_category_path')}; "
+                f"fast=1; preserve_custom_fields=1; custom_field_cnt={cf_cnt}; "
+                f"style_no={r.get('style_no')}; target_path={r.get('target_category_path')}; "
                 f"match_status={r.get('match_status')}; message={r.get('match_message') or ''}"
             )
             cur.execute(
@@ -265,6 +307,9 @@ async def write_products(db: Database, tasks: list[dict[str, Any]], batch_no: st
             "category_id": target_id,
             "category": target_name,
         }
+        custom_fields = normalize_custom_fields(task.get("custom_fields_json"))
+        if custom_fields:
+            body["custom_fields"] = custom_fields
         try:
             update_task(db, task_id, "running")
             resp, token = await request_with_retry(client, token, PRODUCT_SET_API, body, max_retries)
