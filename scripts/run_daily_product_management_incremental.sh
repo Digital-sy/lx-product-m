@@ -14,6 +14,7 @@ LOCK="/tmp/lxpm_product_management_incremental.lock"
   echo "batch_ts=${BATCH_TS}"
   echo "start_time=$(date '+%F %T')"
   echo "workdir=$(pwd)"
+  echo "policy=matched/warning 飞书匹配优先；无飞书匹配但已有领星分类路径的 SKU 走分类路径兜底；无飞书匹配且无分类路径的超旧 SKU 忽略"
 
   flock -n 9 || {
     echo "已有产品管理增量任务正在运行，本次退出：$(date '+%F %T')"
@@ -25,7 +26,7 @@ LOCK="/tmp/lxpm_product_management_incremental.lock"
     exit 0
   fi
 
-  if pgrep -f "apply_lx_spu|apply_feishu_match_to_lx_products|apply_product_custom_fields_from_feishu" >/dev/null; then
+  if pgrep -f "apply_lx_spu|apply_feishu_match_to_lx_products|apply_product_custom_fields_from_feishu|apply_product_custom_fields_from_category_path" >/dev/null; then
     echo "检测到同类写入任务正在运行，本次每日增量退出，避免并行写入：$(date '+%F %T')"
     exit 0
   fi
@@ -41,15 +42,16 @@ LOCK="/tmp/lxpm_product_management_incremental.lock"
     scripts/create_missing_lx_categories_from_feishu_match.py \
     scripts/apply_feishu_match_to_lx_products_fast.py \
     scripts/apply_lx_spu_from_sku_prefix_incremental.py \
-    scripts/apply_product_custom_fields_from_feishu_incremental.py
+    scripts/apply_product_custom_fields_from_feishu_incremental.py \
+    scripts/apply_product_custom_fields_from_category_path_incremental.py
 
-  echo "===== step 1/7 sync lx categories ====="
+  echo "===== step 1/8 sync lx categories ====="
   python -u scripts/sync_categories.py
 
-  echo "===== step 2/7 sync product snapshot ====="
+  echo "===== step 2/8 sync product snapshot ====="
   python -u scripts/sync_product_list_snapshot_fast.py
 
-  echo "===== step 3/7 sync feishu style category match ====="
+  echo "===== step 3/8 sync feishu style category match ====="
   python -u scripts/sync_feishu_style_category_match.py \
     --app-token WD5NbNK4KaXmkgsnrydcGgv9nib \
     --table-id tblzzfcUTcD3YHtM \
@@ -58,10 +60,10 @@ LOCK="/tmp/lxpm_product_management_incremental.lock"
     --show 20 \
     --confirm
 
-  echo "===== step 4/7 create missing lx categories ====="
+  echo "===== step 4/8 create missing lx categories ====="
   python -u scripts/create_missing_lx_categories_from_feishu_match.py --confirm
 
-  echo "===== step 5/7 apply category incremental ====="
+  echo "===== step 5/8 apply category incremental ====="
   python -u scripts/apply_feishu_match_to_lx_products_fast.py \
     --batch-no "category_incremental_${BATCH_TS}" \
     --statuses matched warning \
@@ -69,16 +71,22 @@ LOCK="/tmp/lxpm_product_management_incremental.lock"
     --max-retries 5 \
     --confirm
 
-  echo "===== step 6/7 apply spu incremental ====="
+  echo "===== step 6/8 apply spu incremental ====="
   python -u scripts/apply_lx_spu_from_sku_prefix_incremental.py \
     --batch-no "spu_incremental_${BATCH_TS}" \
     --delay 1.0 \
     --confirm
 
-  echo "===== step 7/7 apply custom fields incremental ====="
+  echo "===== step 7/8 apply custom fields incremental from feishu match ====="
   python -u scripts/apply_product_custom_fields_from_feishu_incremental.py \
     --batch-no "custom_fields_incremental_${BATCH_TS}" \
     --statuses matched warning \
+    --delay 0.5 \
+    --confirm
+
+  echo "===== step 8/8 apply custom fields fallback from category path ====="
+  python -u scripts/apply_product_custom_fields_from_category_path_incremental.py \
+    --batch-no "custom_fields_category_path_${BATCH_TS}" \
     --delay 0.5 \
     --confirm
 
