@@ -9,6 +9,7 @@ PROJECT_DIR="/opt/apps/lx-product-m"
 PYTHON="${PROJECT_DIR}/.venv/bin/python"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOCK="/tmp/lxpm_product_management_incremental.lock"
+WRITE_GUARD_VERSION="2026-07-13-v1"
 
 cd "${PROJECT_DIR}"
 mkdir -p "${LOG_DIR}"
@@ -76,15 +77,27 @@ if /usr/bin/pgrep -f "apply_lx_spu_from_sku_prefix_incremental.py|apply_feishu_m
 fi
 
 # 定时数据同步不应因为 GitHub 暂时不可用、SSH 认证异常或本地改动而整体中断。
-# 拉取失败时继续使用服务器当前版本执行，并在日志中记录警告。
+# 但写回代码必须通过安全版本标记校验，旧版代码禁止继续写领星。
 echo "===== optional git pull ====="
 if ! /usr/bin/timeout 120 /usr/bin/git pull --ff-only origin main; then
-  echo "[WARN] git pull 失败或超时，继续使用服务器当前代码执行本次数据同步。"
+  echo "[WARN] git pull 失败或超时，继续检查服务器当前代码版本。"
 fi
+
+ACTUAL_GUARD_VERSION=""
+if [[ -f "${PROJECT_DIR}/write_guard.version" ]]; then
+  ACTUAL_GUARD_VERSION="$(tr -d '\r\n ' < "${PROJECT_DIR}/write_guard.version")"
+fi
+if [[ "${ACTUAL_GUARD_VERSION}" != "${WRITE_GUARD_VERSION}" ]]; then
+  echo "[FAILED] 写回安全版本不符合要求：expected=${WRITE_GUARD_VERSION}, actual=${ACTUAL_GUARD_VERSION:-missing}"
+  echo "为防止旧品名或不完整字段覆盖领星，本次任务停止，不执行任何写回。"
+  exit 1
+fi
+echo "write_guard_version=${ACTUAL_GUARD_VERSION}"
 
 echo "===== compile check ====="
 "${PYTHON}" -m compileall -q \
   lx_product_m/services/product_write_guard.py \
+  lx_product_m/services/product_service.py \
   lx_product_m/services/spu_service.py \
   scripts/sync_categories.py \
   scripts/sync_product_list_snapshot_fast.py \
