@@ -100,8 +100,16 @@ if ! "${PYTHON}" -u scripts/sync_categories.py; then
   echo "[WARN] 领星分类同步失败；将继续刷新产品快照，但本次停止后续分类/SPU/自定义字段写回。"
 fi
 
+# 分类接口与产品列表接口连续调用会触发领星 code=103 限流，主动留出间隔。
+echo "===== rate-limit spacing before product snapshot: 20s ====="
+/bin/sleep 20
+
 echo "===== step 2/8 sync product snapshot ====="
-"${PYTHON}" -u scripts/sync_product_list_snapshot_fast.py
+"${PYTHON}" -u scripts/sync_product_list_snapshot_fast.py \
+  --page-size 1000 \
+  --max-retries 8 \
+  --retry-base-seconds 10 \
+  --retry-max-seconds 120
 
 if [[ "${CATEGORY_SYNC_OK}" -ne 1 ]]; then
   echo "产品快照已刷新，但分类同步失败，本次安全停止后续写回。"
