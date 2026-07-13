@@ -63,6 +63,7 @@ echo "start_time=$(date '+%F %T %z')"
 echo "workdir=$(pwd)"
 echo "python=${PYTHON}"
 echo "policy=matched/warning 飞书匹配优先；无飞书匹配但已有领星分类路径的 SKU 走分类路径兜底；无飞书匹配且无分类路径的超旧 SKU 忽略"
+echo "write_guard=写入前读取实时品名和完整字段；写入后复查品名；实时品名为空时禁止写入"
 
 if /usr/bin/pgrep -f "apply_product_custom_fields_from_feishu_v4.py" >/dev/null; then
   echo "检测到 V4 自定义字段全量任务仍在运行，本次每日增量退出，避免并行写入：$(date '+%F %T')"
@@ -83,6 +84,8 @@ fi
 
 echo "===== compile check ====="
 "${PYTHON}" -m compileall -q \
+  lx_product_m/services/product_write_guard.py \
+  lx_product_m/services/spu_service.py \
   scripts/sync_categories.py \
   scripts/sync_product_list_snapshot_fast.py \
   scripts/sync_feishu_style_category_match.py \
@@ -128,7 +131,7 @@ echo "===== step 3/8 sync feishu style category match ====="
 echo "===== step 4/8 create missing lx categories ====="
 "${PYTHON}" -u scripts/create_missing_lx_categories_from_feishu_match.py --confirm
 
-echo "===== step 5/8 apply category incremental ====="
+echo "===== step 5/8 apply category incremental (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_feishu_match_to_lx_products_fast.py \
   --batch-no "category_incremental_${BATCH_TS}" \
   --statuses matched warning \
@@ -136,23 +139,25 @@ echo "===== step 5/8 apply category incremental ====="
   --max-retries 5 \
   --confirm
 
-echo "===== step 6/8 apply spu incremental ====="
+echo "===== step 6/8 apply spu incremental (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_lx_spu_from_sku_prefix_incremental.py \
   --batch-no "spu_incremental_${BATCH_TS}" \
   --delay 1.0 \
   --confirm
 
-echo "===== step 7/8 apply custom fields incremental from feishu match ====="
+echo "===== step 7/8 apply custom fields incremental from feishu (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_product_custom_fields_from_feishu_incremental.py \
   --batch-no "custom_fields_incremental_${BATCH_TS}" \
   --statuses matched warning \
   --delay 0.5 \
+  --max-retries 5 \
   --confirm
 
-echo "===== step 8/8 apply custom fields fallback from category path ====="
+echo "===== step 8/8 apply custom fields fallback from category path (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_product_custom_fields_from_category_path_incremental.py \
   --batch-no "custom_fields_category_path_${BATCH_TS}" \
   --delay 0.5 \
+  --max-retries 5 \
   --confirm
 
 {
