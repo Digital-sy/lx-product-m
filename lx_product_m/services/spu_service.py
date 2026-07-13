@@ -10,6 +10,12 @@ from typing import Any
 from ..config import settings
 from ..db import Database, json_dumps
 from ..lingxing_client import LingxingClient
+from .product_write_guard import (
+    extract_product_name,
+    fetch_live_products,
+    request_with_retry,
+    verify_product_name,
+)
 
 SPU_LIST_API = "/erp/sc/routing/storage/spu/spuList"
 SPU_INFO_API = "/erp/sc/routing/storage/spu/info"
@@ -25,6 +31,7 @@ class SpuService:
     def __init__(self, client: LingxingClient, db: Database) -> None:
         self.client = client
         self.db = db
+        self._current_token: str | None = None
 
     @staticmethod
     def _success(result: dict[str, Any]) -> bool:
@@ -67,45 +74,48 @@ class SpuService:
             out.append({"pa_id": pa_id, "pai_id": pai_id})
         return out
 
+    def _token(self, token: str) -> str:
+        return self._current_token or token
+
     async def sku_exists(self, token: str, sku: str) -> bool:
-        result = await self.client.request(token, PRODUCT_DETAIL_API, "POST", req_body={"skus": [sku]})
-        if not self._success(result):
-            raise RuntimeError(f"校验 SKU 是否存在失败：{result}")
-        for item in result.get("data") or []:
-            if str(item.get("sku") or item.get("SKU") or "").strip() == sku:
-                return True
-        return False
+        products, current_token = await fetch_live_products(
+            self.client,
+            self._token(token),
+            [sku],
+            max_retries=5,
+            batch_size=100,
+            delay_seconds=0,
+        )
+        self._current_token = current_token
+        return sku in products
 
     async def batch_sku_exists(self, token: str, skus: list[str]) -> set[str]:
-        """批量校验 SKU 是否存在，batchGetProductInfo 一次最多按 100 个 SKU 请求。"""
-        clean = []
-        seen = set()
-        for sku in skus:
-            value = (sku or "").strip()
-            if value and value not in seen:
-                clean.append(value)
-                seen.add(value)
-        exists: set[str] = set()
-        for i in range(0, len(clean), 100):
-            batch = clean[i:i + 100]
-            result = await self.client.request(token, PRODUCT_DETAIL_API, "POST", req_body={"skus": batch})
-            if not self._success(result):
-                raise RuntimeError(f"批量校验 SKU 是否存在失败：{result}")
-            for item in result.get("data") or []:
-                sku = str(item.get("sku") or item.get("SKU") or "").strip()
-                if sku:
-                    exists.add(sku)
-            if settings.collection_delay_seconds > 0 and i + 100 < len(clean):
-                await asyncio.sleep(settings.collection_delay_seconds)
-        return exists
+        products, current_token = await fetch_live_products(
+            self.client,
+            self._token(token),
+            skus,
+            max_retries=5,
+            batch_size=100,
+            delay_seconds=max(settings.collection_delay_seconds, 0.5),
+        )
+        self._current_token = current_token
+        return set(products)
 
     async def fetch_spu_list(self, token: str, page_size: int = 200) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         offset = 0
         page_size = max(1, min(page_size, 200))
+        current_token = self._token(token)
         while True:
             body = {"offset": offset, "length": page_size}
-            result = await self.client.request(token, SPU_LIST_API, "POST", req_body=body)
+            result, current_token = await request_with_retry(
+                self.client,
+                current_token,
+                SPU_LIST_API,
+                body,
+                max_retries=5,
+            )
+            self._current_token = current_token
             if not self._success(result):
                 raise RuntimeError(f"查询多属性产品列表失败：{result}")
             items = result.get("data") or []
@@ -127,7 +137,14 @@ class SpuService:
             body["ps_id"] = ps_id
         if spu:
             body["spu"] = spu
-        result = await self.client.request(token, SPU_INFO_API, "POST", req_body=body)
+        result, current_token = await request_with_retry(
+            self.client,
+            self._token(token),
+            SPU_INFO_API,
+            body,
+            max_retries=5,
+        )
+        self._current_token = current_token
         if not self._success(result):
             if self._is_spu_not_found(result):
                 return None
@@ -161,11 +178,13 @@ class SpuService:
         if sku in result.get("skipped", []):
             status = "skipped"
         elif sku in result.get("blocked", []):
-            raise RuntimeError(f"SKU 在领星不存在：{sku}")
+            raise RuntimeError(f"SKU 在领星不存在或实时品名为空：{sku}")
         elif sku in result.get("failed", []):
             raise RuntimeError(f"SPU 绑定失败：{sku} -> {spu}")
         elif sku in result.get("verify_failed", []):
             raise RuntimeError(f"SPU 写入接口成功，但复查未发现 SKU 关联：{sku}")
+        elif sku in result.get("name_verify_failed", []):
+            raise RuntimeError(f"SPU 写入后品名复查失败：{sku}")
         elif sku in result.get("skipped_already_bound", []):
             status = "skipped_already_bound"
         return {"sku": sku, "spu": spu, "status": status, "spu_sku_count": result.get("spu_sku_count", 0)}
@@ -181,10 +200,12 @@ class SpuService:
         batch_no: str = "manual",
         task_id: int | None = None,
     ) -> dict[str, Any]:
-        """同一个 SPU 下多 SKU 合并绑定。
+        """同一个 SPU 下多 SKU 合并绑定，并保护全部 SKU 当前品名。
 
-        将同 SPU 的多个 SKU 合成一次 spu/set，避免逐个 SKU 重复执行
-        sku_exists -> spu/info -> spu/set -> verify。
+        spu/set 会整体提交 sku_list，因此写入前会重新读取：
+        - 本次新增 SKU 的实时品名；
+        - SPU 下全部既有 SKU 的实时品名。
+        任一既有 SKU 无法取得实时品名时，整组停止写入。
         """
         spu = self.validate_spu_name(spu)
         normalized_attribute = self.normalize_attribute(sku_attribute)
@@ -194,11 +215,12 @@ class SpuService:
             "blocked": [],
             "failed": [],
             "verify_failed": [],
+            "name_verify_failed": [],
             "skipped_already_bound": [],
             "spu_sku_count": 0,
         }
         rows: list[dict[str, Any]] = []
-        seen = set()
+        seen: set[str] = set()
         for row in sku_rows:
             sku = str(row.get("sku") or "").strip()
             if not sku or sku in seen:
@@ -208,21 +230,36 @@ class SpuService:
         if not rows:
             return summary
 
+        current_token = self._token(token)
+
+        # 先读取本次候选 SKU 的实时详情，快照品名不参与写回。
         if not allow_create_sku:
-            existing_skus = await self.batch_sku_exists(token, [r["sku"] for r in rows])
-            active_rows = []
+            live_requested, current_token = await fetch_live_products(
+                self.client,
+                current_token,
+                [row["sku"] for row in rows],
+                max_retries=5,
+                batch_size=100,
+                delay_seconds=max(settings.collection_delay_seconds, 0.5),
+            )
+            self._current_token = current_token
+            active_rows: list[dict[str, Any]] = []
             for row in rows:
-                if row["sku"] in existing_skus:
+                product = live_requested.get(row["sku"])
+                live_name = extract_product_name(product)
+                if product and live_name:
+                    row["product_name"] = live_name
                     active_rows.append(row)
                 else:
-                    err = f"SKU 在领星不存在：{row['sku']}"
+                    err = f"SKU实时详情不存在或实时品名为空，禁止SPU写入：{row['sku']}"
                     self._write_change_log(batch_no, task_id, row["sku"], spu, "blocked", None, None, None, err)
                     summary["blocked"].append(row["sku"])
             rows = active_rows
             if not rows:
                 return summary
 
-        detail = await self.get_spu_detail(token, spu=spu)
+        detail = await self.get_spu_detail(current_token, spu=spu)
+        current_token = self._token(current_token)
         existing_entries = self._extract_sku_entries(detail)
         existing_set = {entry["sku"] for entry in existing_entries}
         pending_rows: list[dict[str, Any]] = []
@@ -238,17 +275,79 @@ class SpuService:
             return summary
 
         while pending_rows:
-            new_entries = []
+            # spu/set 是整组写入：必须保护既有和新增 SKU 的实时品名。
+            protected_skus = [entry["sku"] for entry in existing_entries] + [row["sku"] for row in pending_rows]
+            live_all, current_token = await fetch_live_products(
+                self.client,
+                current_token,
+                protected_skus,
+                max_retries=5,
+                batch_size=100,
+                delay_seconds=max(settings.collection_delay_seconds, 0.5),
+            )
+            self._current_token = current_token
+
+            missing_existing = [
+                entry["sku"]
+                for entry in existing_entries
+                if not extract_product_name(live_all.get(entry["sku"]))
+            ]
+            if missing_existing:
+                err = (
+                    "SPU现有SKU实时品名读取失败，为防止整体覆盖已停止写入："
+                    + ",".join(missing_existing[:20])
+                )
+                for row in pending_rows:
+                    self._write_change_log(batch_no, task_id, row["sku"], spu, "guard_blocked", None, None, None, err)
+                    summary["failed"].append(row["sku"])
+                return summary
+
+            missing_pending = [
+                row["sku"]
+                for row in pending_rows
+                if not extract_product_name(live_all.get(row["sku"]))
+            ]
+            if missing_pending:
+                next_pending: list[dict[str, Any]] = []
+                for row in pending_rows:
+                    if row["sku"] in missing_pending:
+                        err = "新增SKU实时品名为空，禁止SPU写入"
+                        self._write_change_log(batch_no, task_id, row["sku"], spu, "blocked", None, None, None, err)
+                        summary["blocked"].append(row["sku"])
+                    else:
+                        next_pending.append(row)
+                pending_rows = next_pending
+                if not pending_rows:
+                    return summary
+                continue
+
+            prewrite_names = {
+                sku: extract_product_name(product)
+                for sku, product in live_all.items()
+                if extract_product_name(product)
+            }
+
+            safe_existing_entries: list[dict[str, Any]] = []
+            for entry in existing_entries:
+                safe_entry = dict(entry)
+                safe_entry["product_name"] = prewrite_names[entry["sku"]]
+                safe_existing_entries.append(safe_entry)
+
+            new_entries: list[dict[str, Any]] = []
             for row in pending_rows:
-                entry: dict[str, Any] = {"sku": row["sku"], "attribute": normalized_attribute}
-                if row.get("product_name"):
-                    entry["product_name"] = row["product_name"]
-                new_entries.append(entry)
+                row["product_name"] = prewrite_names[row["sku"]]
+                new_entries.append(
+                    {
+                        "sku": row["sku"],
+                        "product_name": row["product_name"],
+                        "attribute": normalized_attribute,
+                    }
+                )
 
             body: dict[str, Any] = {
                 "spu": spu,
                 "spu_name": (spu_name or spu),
-                "sku_list": existing_entries + new_entries,
+                "sku_list": safe_existing_entries + new_entries,
             }
             if detail:
                 for field in _CARRY_OVER_FIELDS:
@@ -258,23 +357,55 @@ class SpuService:
                     elif value not in (None, "", 0):
                         body[field] = value
 
-            response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
+            log_body = dict(body)
+            log_body["_write_guard"] = {
+                "product_name_source": "live_product_detail",
+                "protected_sku_count": len(prewrite_names),
+                "protected_existing_sku_count": len(safe_existing_entries),
+                "protected_new_sku_count": len(new_entries),
+            }
+
+            response, current_token = await request_with_retry(
+                self.client,
+                current_token,
+                SPU_SET_API,
+                body,
+                max_retries=5,
+            )
+            self._current_token = current_token
             if not self._success(response) and not normalized_attribute and self._looks_like_attribute_error(response):
                 for entry in body["sku_list"]:
                     if not entry.get("attribute"):
                         entry["attribute"] = [{"pa_id": "", "pai_id": ""}]
-                response = await self.client.request(token, SPU_SET_API, "POST", req_body=body)
+                response, current_token = await request_with_retry(
+                    self.client,
+                    current_token,
+                    SPU_SET_API,
+                    body,
+                    max_retries=5,
+                )
+                self._current_token = current_token
 
             if self._success(response):
                 break
 
             already_bound_sku = self._extract_already_bound_sku(response)
             if already_bound_sku:
-                removed = False
                 next_pending = []
+                removed = False
                 for row in pending_rows:
                     if row["sku"] == already_bound_sku:
-                        self._write_change_log(batch_no, task_id, row["sku"], spu, "skipped_already_bound", body, response, None, str(response))
+                        self._write_change_log(
+                            batch_no,
+                            task_id,
+                            row["sku"],
+                            spu,
+                            "skipped_already_bound",
+                            log_body,
+                            response,
+                            None,
+                            str(response),
+                        )
                         summary["skipped_already_bound"].append(row["sku"])
                         removed = True
                     else:
@@ -286,22 +417,75 @@ class SpuService:
                     return summary
 
             for row in pending_rows:
-                self._write_change_log(batch_no, task_id, row["sku"], spu, "failed", body, response, None, str(response))
+                self._write_change_log(batch_no, task_id, row["sku"], spu, "failed", log_body, response, None, str(response))
                 summary["failed"].append(row["sku"])
             return summary
 
         if settings.collection_delay_seconds > 0:
             await asyncio.sleep(settings.collection_delay_seconds)
-        verify = await self.get_spu_detail(token, spu=spu)
+
+        verify = await self.get_spu_detail(current_token, spu=spu)
+        current_token = self._token(current_token)
         verify_entries = self._extract_sku_entries(verify)
         verify_skus = {entry["sku"] for entry in verify_entries}
         summary["spu_sku_count"] = len(verify_skus)
+
+        # 复查所有参与整组提交的 SKU 品名是否保持不变。
+        post_products, current_token = await fetch_live_products(
+            self.client,
+            current_token,
+            list(prewrite_names),
+            max_retries=5,
+            batch_size=100,
+            delay_seconds=max(settings.collection_delay_seconds, 0.5),
+        )
+        self._current_token = current_token
+        changed_names: dict[str, str] = {}
+        for sku, expected_name in prewrite_names.items():
+            name_ok, name_error = verify_product_name(post_products.get(sku), expected_name)
+            if not name_ok:
+                changed_names[sku] = name_error
+
+        # 既有 SKU 也属于本次整组提交范围，检测到品名变化必须记录。
+        pending_skus = {row["sku"] for row in pending_rows}
+        for sku, error in changed_names.items():
+            if sku not in pending_skus:
+                self._write_change_log(
+                    batch_no,
+                    task_id,
+                    sku,
+                    spu,
+                    "name_verify_failed",
+                    {"_write_guard": {"expected_product_name": prewrite_names.get(sku)}},
+                    response,
+                    {"data": [post_products.get(sku)] if post_products.get(sku) else []},
+                    error,
+                )
+                summary["name_verify_failed"].append(sku)
+
         for row in pending_rows:
-            ok = row["sku"] in verify_skus
-            status = "success" if ok else "verify_failed"
-            err = "" if ok else "写入接口成功，但复查未发现 SKU 关联"
-            self._write_change_log(batch_no, task_id, row["sku"], spu, status, body, response, verify, err)
-            summary[status].append(row["sku"])
+            sku = row["sku"]
+            if sku in changed_names:
+                status = "name_verify_failed"
+                error = changed_names[sku]
+            elif sku not in verify_skus:
+                status = "verify_failed"
+                error = "写入接口成功，但复查未发现 SKU 关联"
+            else:
+                status = "success"
+                error = ""
+            self._write_change_log(
+                batch_no,
+                task_id,
+                sku,
+                spu,
+                status,
+                {"_write_guard": {"expected_product_name": prewrite_names.get(sku)}},
+                response,
+                verify,
+                error,
+            )
+            summary[status].append(sku)
         return summary
 
     async def bind_batch(
@@ -318,7 +502,11 @@ class SpuService:
         for spu, rows in grouped.items():
             try:
                 result = await self.ensure_spu_and_bind_skus(
-                    token, spu=spu, sku_rows=rows, batch_no=batch_no, sku_attribute=sku_attribute
+                    token,
+                    spu=spu,
+                    sku_rows=rows,
+                    batch_no=batch_no,
+                    sku_attribute=sku_attribute,
                 )
                 for status, skus in result.items():
                     if not isinstance(skus, list):
@@ -327,11 +515,11 @@ class SpuService:
                         summary["success"].extend(skus)
                     elif status == "skipped":
                         summary["skipped"].extend(skus)
-                    elif status in ("failed", "blocked", "verify_failed"):
+                    elif status in ("failed", "blocked", "verify_failed", "name_verify_failed"):
                         summary["failed"].extend(skus)
             except Exception as exc:
                 print(f"[FAILED] spu={spu}: {exc}")
-                summary["failed"].extend([str(r.get("sku") or "") for r in rows])
+                summary["failed"].extend([str(row.get("sku") or "") for row in rows])
             if settings.collection_delay_seconds > 0:
                 await asyncio.sleep(settings.collection_delay_seconds)
         return summary
@@ -350,7 +538,11 @@ class SpuService:
                     pai_id = attr.get("pai_id")
                     if pa_id not in (None, "") and pai_id not in (None, ""):
                         attribute.append({"pa_id": pa_id, "pai_id": pai_id})
-            entries.append({"sku": sku, "attribute": attribute})
+            entry: dict[str, Any] = {"sku": sku, "attribute": attribute}
+            product_name = str(item.get("product_name") or item.get("productName") or "").strip()
+            if product_name:
+                entry["product_name"] = product_name
+            entries.append(entry)
         return entries
 
     @staticmethod
@@ -361,8 +553,8 @@ class SpuService:
     @staticmethod
     def _extract_already_bound_sku(result: dict[str, Any]) -> str:
         text = " ".join(str(result.get(key) or "") for key in ("message", "msg", "error_details"))
-        m = _ALREADY_BOUND_RE.search(text)
-        return m.group(1).strip() if m else ""
+        match = _ALREADY_BOUND_RE.search(text)
+        return match.group(1).strip() if match else ""
 
     def _write_change_log(
         self,
