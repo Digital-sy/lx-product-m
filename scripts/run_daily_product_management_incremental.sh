@@ -46,6 +46,42 @@ on_error() {
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
+check_name_guard_failures() {
+  local table_name="$1"
+  local batch_no="$2"
+  local failure_count
+  failure_count="$("${PYTHON}" - "${table_name}" "${batch_no}" <<'PY'
+import sys
+from lx_product_m.db import Database
+
+table_name = sys.argv[1]
+batch_no = sys.argv[2]
+allowed = {
+    "lxpm_product_category_change_log",
+    "lxpm_product_custom_field_change_log",
+    "lxpm_spu_change_log",
+}
+if table_name not in allowed:
+    raise SystemExit(f"非法日志表：{table_name}")
+
+db = Database()
+try:
+    row = db.fetch_one(
+        f"SELECT COUNT(*) AS cnt FROM `{table_name}` WHERE batch_no=%s AND status='name_verify_failed'",
+        (batch_no,),
+    )
+    print(int((row or {}).get("cnt") or 0))
+finally:
+    db.close()
+PY
+)"
+  if [[ "${failure_count}" != "0" ]]; then
+    echo "[FAILED] 品名防覆盖复查失败：table=${table_name}, batch=${batch_no}, count=${failure_count}"
+    return 1
+  fi
+  echo "name_guard_check=passed table=${table_name} batch=${batch_no}"
+}
+
 {
   echo "status=started"
   echo "batch_ts=${BATCH_TS}"
@@ -144,34 +180,42 @@ echo "===== step 3/8 sync feishu style category match ====="
 echo "===== step 4/8 create missing lx categories ====="
 "${PYTHON}" -u scripts/create_missing_lx_categories_from_feishu_match.py --confirm
 
+CATEGORY_BATCH="category_incremental_${BATCH_TS}"
 echo "===== step 5/8 apply category incremental (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_feishu_match_to_lx_products_fast.py \
-  --batch-no "category_incremental_${BATCH_TS}" \
+  --batch-no "${CATEGORY_BATCH}" \
   --statuses matched warning \
   --delay 0.1 \
   --max-retries 5 \
   --confirm
+check_name_guard_failures "lxpm_product_category_change_log" "${CATEGORY_BATCH}"
 
+SPU_BATCH="spu_incremental_${BATCH_TS}"
 echo "===== step 6/8 apply spu incremental (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_lx_spu_from_sku_prefix_incremental.py \
-  --batch-no "spu_incremental_${BATCH_TS}" \
+  --batch-no "${SPU_BATCH}" \
   --delay 1.0 \
   --confirm
+check_name_guard_failures "lxpm_spu_change_log" "${SPU_BATCH}"
 
+CUSTOM_FIELDS_BATCH="custom_fields_incremental_${BATCH_TS}"
 echo "===== step 7/8 apply custom fields incremental from feishu (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_product_custom_fields_from_feishu_incremental.py \
-  --batch-no "custom_fields_incremental_${BATCH_TS}" \
+  --batch-no "${CUSTOM_FIELDS_BATCH}" \
   --statuses matched warning \
   --delay 0.5 \
   --max-retries 5 \
   --confirm
+check_name_guard_failures "lxpm_product_custom_field_change_log" "${CUSTOM_FIELDS_BATCH}"
 
+CATEGORY_PATH_BATCH="custom_fields_category_path_${BATCH_TS}"
 echo "===== step 8/8 apply custom fields fallback from category path (live-name guarded) ====="
 "${PYTHON}" -u scripts/apply_product_custom_fields_from_category_path_incremental.py \
-  --batch-no "custom_fields_category_path_${BATCH_TS}" \
+  --batch-no "${CATEGORY_PATH_BATCH}" \
   --delay 0.5 \
   --max-retries 5 \
   --confirm
+check_name_guard_failures "lxpm_product_custom_field_change_log" "${CATEGORY_PATH_BATCH}"
 
 {
   echo "status=success"
