@@ -10,6 +10,13 @@ from ..db import Database, json_dumps
 from ..lingxing_client import LingxingClient
 from ..sku import extract_spu
 from .category_service import CategoryService
+from .product_write_guard import (
+    build_guarded_product_set_body,
+    extract_product_name,
+    fetch_live_products,
+    request_with_retry,
+    verify_product_name,
+)
 
 PRODUCT_DETAIL_API = "/erp/sc/routing/data/local_inventory/batchGetProductInfo"
 PRODUCT_LIST_API = "/erp/sc/routing/data/local_inventory/productList"
@@ -85,7 +92,10 @@ class ProductService:
             if not batch:
                 continue
             result = await self.client.request(
-                token, PRODUCT_DETAIL_API, "POST", req_body={"skus": batch}
+                token,
+                PRODUCT_DETAIL_API,
+                "POST",
+                req_body={"skus": batch},
             )
             if not self._success(result):
                 for sku in batch:
@@ -169,7 +179,12 @@ class ProductService:
                 (`sku`, `last_api_code`, `last_api_message`, `raw_json`, `synced_at`)
                 VALUES (%s,%s,%s,%s,NOW())
                 """,
-                (sku, result.get("code"), str(result.get("message") or result.get("msg") or "")[:500], json_dumps(result)),
+                (
+                    sku,
+                    result.get("code"),
+                    str(result.get("message") or result.get("msg") or "")[:500],
+                    json_dumps(result),
+                ),
             )
 
     async def query_and_save(self, token: str, skus: list[str]) -> list[dict[str, Any]]:
@@ -204,35 +219,116 @@ class ProductService:
         batch_no: str = "manual",
         task_id: int | None = None,
     ) -> dict[str, Any]:
+        """安全修改分类：实时品名、实时完整自定义字段、写后品名复查。"""
         target = self.resolve_target_category(category_id, category_name)
         new_id = int(target["cid"])
         new_name = str(target["title"])
-        products = await self.batch_get_product_info(token, [sku])
-        if not products:
-            raise RuntimeError(f"SKU 不存在或详情为空：{sku}")
-        product = products[0]
+
+        live_map, current_token = await fetch_live_products(
+            self.client,
+            token,
+            [sku],
+            max_retries=5,
+            batch_size=100,
+            delay_seconds=0,
+        )
+        product = live_map.get(sku)
+        if not product:
+            raise RuntimeError(f"SKU 不存在或实时详情为空：{sku}")
         self.save_product_snapshot(product)
-        product_name = str(product.get("product_name") or product.get("productName") or "").strip()
+
+        product_name = extract_product_name(product)
         if not product_name:
-            raise RuntimeError(f"SKU={sku} 未返回 product_name，已停止")
+            raise RuntimeError(f"SKU={sku} 实时 product_name 为空，禁止写入")
         old_id, old_name = self.extract_category(product)
-        body = {"sku": sku, "product_name": product_name, "category_id": new_id, "category": new_name}
-        response = await self.client.request(token, PRODUCT_SET_API, "POST", req_body=body)
+
+        body, guard_meta = build_guarded_product_set_body(
+            product,
+            sku=sku,
+            target_category_id=new_id,
+            target_category_name=new_name,
+            target_custom_fields=None,
+        )
+        log_body = dict(body)
+        log_body["_write_guard"] = {
+            **guard_meta,
+            "name_source": "live_product_detail",
+            "preserve_live_custom_fields": True,
+        }
+
+        response, current_token = await request_with_retry(
+            self.client,
+            current_token,
+            PRODUCT_SET_API,
+            body,
+            max_retries=5,
+        )
         if not self._success(response):
-            self._write_change_log(batch_no, task_id, sku, product_name, old_id, old_name, new_id, new_name, None, "", "failed", body, response, None, str(response))
+            self._write_change_log(
+                batch_no,
+                task_id,
+                sku,
+                product_name,
+                old_id,
+                old_name,
+                new_id,
+                new_name,
+                None,
+                "",
+                "failed",
+                log_body,
+                response,
+                None,
+                str(response),
+            )
             raise RuntimeError(f"产品分类写入失败：{response}")
-        verify_products = await self.batch_get_product_info(token, [sku])
+
+        verify_map, current_token = await fetch_live_products(
+            self.client,
+            current_token,
+            [sku],
+            max_retries=5,
+            batch_size=100,
+            delay_seconds=0,
+        )
+        verify_product = verify_map.get(sku)
         verify_id = None
         verify_name = ""
-        if verify_products:
-            self.save_product_snapshot(verify_products[0])
-            verify_id, verify_name = self.extract_category(verify_products[0])
-        ok = verify_id == new_id or verify_name == new_name
-        status = "success" if ok else "verify_failed"
-        err = "" if ok else "写入接口成功，但复查未命中目标分类"
-        self._write_change_log(batch_no, task_id, sku, product_name, old_id, old_name, new_id, new_name, verify_id, verify_name, status, body, response, {"data": verify_products}, err)
-        if not ok:
-            raise RuntimeError(err)
+        if verify_product:
+            self.save_product_snapshot(verify_product)
+            verify_id, verify_name = self.extract_category(verify_product)
+
+        name_ok, name_error = verify_product_name(verify_product, product_name)
+        category_ok = verify_id == new_id
+        if not name_ok:
+            status = "name_verify_failed"
+            error = name_error
+        elif not category_ok:
+            status = "verify_failed"
+            error = "写入接口成功，但复查未命中目标分类"
+        else:
+            status = "success"
+            error = ""
+
+        self._write_change_log(
+            batch_no,
+            task_id,
+            sku,
+            product_name,
+            old_id,
+            old_name,
+            new_id,
+            new_name,
+            verify_id,
+            verify_name,
+            status,
+            log_body,
+            response,
+            {"data": [verify_product] if verify_product else [], "name_guard_expected": product_name},
+            error,
+        )
+        if status != "success":
+            raise RuntimeError(error)
         return {
             "sku": sku,
             "old_category_id": old_id,
@@ -241,6 +337,7 @@ class ProductService:
             "new_category_name": new_name,
             "verify_category_id": verify_id,
             "verify_category_name": verify_name,
+            "verified_product_name": product_name,
         }
 
     def _write_change_log(
@@ -271,5 +368,21 @@ class ProductService:
                  `request_json`, `response_json`, `verify_response_json`, `error_message`)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (batch_no, task_id, sku, product_name, old_id, old_name, new_id, new_name, verify_id, verify_name, status, json_dumps(req), json_dumps(resp), json_dumps(verify_resp), err),
+                (
+                    batch_no,
+                    task_id,
+                    sku,
+                    product_name,
+                    old_id,
+                    old_name,
+                    new_id,
+                    new_name,
+                    verify_id,
+                    verify_name,
+                    status,
+                    json_dumps(req),
+                    json_dumps(resp),
+                    json_dumps(verify_resp),
+                    err,
+                ),
             )
