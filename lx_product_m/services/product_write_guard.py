@@ -183,7 +183,7 @@ async def request_with_retry(
             await asyncio.sleep(wait_seconds)
             continue
 
-        if clean(response.get("code")) == "0":
+        if str(response.get("code")) == "0":
             return response, current_token
 
         if is_token_error(response):
@@ -214,6 +214,8 @@ async def fetch_live_products(
     max_retries: int = 5,
     batch_size: int = 100,
     delay_seconds: float = 0.5,
+    retry_base_seconds: float = 2.0,
+    retry_max_seconds: float = 60.0,
 ) -> tuple[dict[str, dict[str, Any]], str]:
     """批量读取实时产品详情；返回 SKU->详情 和可能刷新的 token。"""
     clean_skus: list[str] = []
@@ -235,8 +237,10 @@ async def fetch_live_products(
             PRODUCT_DETAIL_API,
             {"skus": batch},
             max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
         )
-        if clean(response.get("code")) != "0":
+        if str(response.get("code")) != "0":
             raise RuntimeError(f"读取领星实时产品详情失败：{response}")
         for product in response.get("data") or []:
             sku = extract_sku(product)
