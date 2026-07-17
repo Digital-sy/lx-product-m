@@ -610,7 +610,12 @@ def create_failure_workbook(rows: Sequence[dict[str, str]], output: Path) -> Non
     workbook.save(output)
 
 
-async def apply_review_file(args: argparse.Namespace) -> int:
+async def apply_review_file(
+    args: argparse.Namespace,
+    *,
+    write_values: set[str] | None = None,
+    failure_prefix: str = "color_system_tagging_failures",
+) -> int:
     if not args.review_file:
         raise ValueError("--apply 必须同时指定 --review-file，禁止直接生成后写入")
     if not args.allow_outside_low_peak and not is_beijing_low_peak():
@@ -621,21 +626,36 @@ async def apply_review_file(args: argparse.Namespace) -> int:
         )
 
     review_path = Path(args.review_file).expanduser().resolve()
-    targets = load_review_file(review_path)
+    review_targets = load_review_file(review_path)
+    if write_values is not None:
+        invalid_write_values = set(write_values) - TARGET_VALUES
+        if invalid_write_values:
+            raise ValueError(f"非法写入值过滤：{sorted(invalid_write_values)}")
+        targets = [item for item in review_targets if item["拟打值"] in write_values]
+    else:
+        targets = review_targets
+    preserved_count = len(review_targets) - len(targets)
     print("===== 颜色体系审阅清单写入 =====")
     print(f"审阅清单：{review_path}")
-    print(f"处理 SKU：{len(targets):,}")
+    print(f"处理 SKU：{len(review_targets):,}")
+    print(f"计划写入：{len(targets):,}；按规则不写：{preserved_count:,}")
     print("安全策略：实时产品详情 + 完整自定义字段合并 + product/set")
     print("code=103：固定等待 30 秒，最多重试 3 次")
     if not targets:
-        print("清单为空，无需写入")
-        print("执行统计：处理=0 成功=0 失败=0 跳过=0")
+        print("没有需要写入的行")
+        print(
+            f"执行统计：处理={len(review_targets):,} 成功=0 失败=0 "
+            f"跳过={preserved_count:,}"
+        )
         return 0
 
     db = Database()
     client = LingxingClient(db=db, enable_api_log=True)
     failures: list[dict[str, str]] = []
-    stats: Counter[str] = Counter(processed=len(targets))
+    stats: Counter[str] = Counter(
+        processed=len(review_targets),
+        skipped=preserved_count,
+    )
     try:
         token = (await client.generate_token()).token
         field_id = validate_field_id(args.field_id or os.getenv(COLOR_FIELD_ID_ENV, ""))
@@ -721,9 +741,9 @@ async def apply_review_file(args: argparse.Namespace) -> int:
                     stats["failed"] += 1
 
                 done = stats["success"] + stats["failed"] + stats["skipped"]
-                if done % 100 == 0 or done == len(targets):
+                if done % 100 == 0 or done == len(review_targets):
                     print(
-                        f"写入进度：{done:,}/{len(targets):,} "
+                        f"写入进度：{done:,}/{len(review_targets):,} "
                         f"成功={stats['success']:,} 失败={stats['failed']:,} "
                         f"跳过={stats['skipped']:,}"
                     )
@@ -737,7 +757,7 @@ async def apply_review_file(args: argparse.Namespace) -> int:
     if failures:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         failure_path = OUTPUT_DIR / (
-            f"color_system_tagging_failures_{datetime.now(BEIJING_TZ):%Y%m%d_%H%M%S}.xlsx"
+            f"{failure_prefix}_{datetime.now(BEIJING_TZ):%Y%m%d_%H%M%S}.xlsx"
         )
         create_failure_workbook(failures, failure_path)
 
