@@ -39,8 +39,11 @@ export LX_COLOR_SYSTEM_FIELD_ID='<颜色体系字段ID>'
 python -u scripts/color_system_tagging.py \
   --apply \
   --review-file reports_analysis/color_system_tagging_dryrun_YYYYMMDD.xlsx \
-  --delay 0.5
+  --delay 0.5 \
+  --verify-delay 1
 ```
+
+第一轮正式写入**只提交拟打值为 `A2023` 的行**。即使审阅文件同时包含 `待定`，待定行也不会调用领星写接口。
 
 字段 ID 未显式提供时，脚本会依次尝试从产品快照和领星实时产品详情发现。正式执行仍建议通过 `LX_COLOR_SYSTEM_FIELD_ID` 或 `--field-id` 固定字段 ID。
 
@@ -50,10 +53,22 @@ python -u scripts/color_system_tagging.py \
 - 每批写入前重新读取领星实时产品详情。
 - 复用 `product_write_guard.py` 合并实时完整自定义字段，保留实时品名和当前分类后再提交 `product/set`。
 - 实时值已经等于目标值的 SKU 计为跳过，不重复写入。
+- 每批 `product/set` 成功后重新读取实时产品详情，复查：SKU、产品品名、分类、颜色体系以及写入请求中携带的全部原有自定义字段。
+- 接口返回成功但写后复查不一致时，不计成功，写入失败清单并返回非 0 退出码。
 - `code=103` 固定等待 30 秒，最多重试 3 次；最终失败写入 `reports_analysis/color_system_tagging_failures_YYYYMMDD_HHMMSS.xlsx`，其余 SKU 继续。
 - 控制台输出处理、成功、失败、跳过数量。
 
-## 3. 执行时间
+## 3. 单条生产验证
+
+批量执行前建议复制审阅文件，只保留 1 条 `A2023` 记录后先执行一次。脚本自身会写后复查，仍建议再刷新产品快照并人工核对：
+
+- 颜色体系精确等于 `A2023`；
+- 产品品名未变化；
+- 分类 ID、分类名称未变化；
+- 其他自定义字段未丢失、未改变；
+- API 日志中 `code=0`，并保留 request_id。
+
+## 4. 执行时间
 
 正式写入默认只允许北京时间 `00:00-06:00`，与现有 `22:30` 定时任务错开。建议人工审阅后安排在 `02:00` 左右执行。
 
@@ -63,4 +78,4 @@ python -u scripts/color_system_tagging.py \
 --allow-outside-low-peak
 ```
 
-该参数只解除时间保护，不会绕过审阅清单和安全合并约束。
+该参数只解除时间保护，不会绕过 A2023 过滤、审阅清单、安全合并和写后复查。
