@@ -5,10 +5,10 @@
 默认只生成审阅清单。范围必须来自第一轮 Excel 中拟打值为“待定”的 SKU；
 正式写入只提交审阅后拟打值为 A2023 的行，其余行保持不动。
 
-开发年份判定规则：原值为“历史”，或清洗后可解析为整数年份且 <= 2024，
-转 A2023；清洗后可解析为整数年份且 >= 2025、空值、无法解析的意外值均
-维持待定，并继续输出意外值清单。清洗包含 strip 空白、去除“年”字后缀、
-全角转半角。
+开发年份判定规则：原值为“历史”，或清洗后为 2000-2024 范围内的四位年份，
+转 A2023；2025-2100 范围内的四位年份、空值维持待定；其他值（包括 23、0、
+1999、2101 等异常纯数字）均作为意外值维持待定。清洗包含 strip 空白、去除
+“年”字后缀、全角转半角。
 """
 from __future__ import annotations
 
@@ -45,6 +45,9 @@ from scripts.color_system_tagging import (
 DEVELOPMENT_YEAR_FIELD_NAME = "开发年份"
 DEVELOPMENT_YEAR_FIELD_ID = "207714670595318273"
 EXPECTED_PENDING_COUNT = 9823
+MIN_DEVELOPMENT_YEAR = 2000
+A2023_MAX_YEAR = 2024
+MAX_DEVELOPMENT_YEAR = 2100
 DETAIL_HEADERS = ["SKU", "开发年份原值", "拟打值"]
 
 STATUS_CONVERT = "转 A2023"
@@ -75,8 +78,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="写入人工审阅后的第二轮清单")
     parser.add_argument("--review-file", default="", help="--apply 时必填：第二轮审阅 Excel")
     parser.add_argument("--field-id", default="", help="领星“颜色体系”字段 ID")
-    parser.add_argument("--batch-size", type=int, default=100, help="写前实时读取批次，最大100")
+    parser.add_argument("--batch-size", type=int, default=100, help="写前/写后实时读取批次，最大100")
     parser.add_argument("--delay", type=float, default=0.5, help="每个实际写入 SKU 后等待秒数")
+    parser.add_argument(
+        "--verify-delay",
+        type=float,
+        default=1.0,
+        help="每批 product/set 成功后，写后复查前等待秒数",
+    )
     parser.add_argument(
         "--allow-outside-low-peak",
         action="store_true",
@@ -123,7 +132,7 @@ def original_field_value(item: dict[str, Any]) -> str:
 
 
 def extract_development_year(value: Any) -> str:
-    """保留原始值，不 strip；脏空格必须作为意外值暴露。"""
+    """保留原始值用于分布审阅；实际判定会调用 clean_development_year。"""
     values: list[str] = []
     for item in parse_custom_fields(value):
         if (
@@ -154,11 +163,12 @@ def classify_development_year(raw_value: Any) -> tuple[str, str]:
         return "A2023", STATUS_CONVERT
     if value == "":
         return "待定", STATUS_KEEP_EMPTY
-    if re.fullmatch(r"\d+", value):
+    if re.fullmatch(r"\d{4}", value):
         year = int(value)
-        if year <= 2024:
+        if MIN_DEVELOPMENT_YEAR <= year <= A2023_MAX_YEAR:
             return "A2023", STATUS_CONVERT
-        return "待定", STATUS_KEEP_FUTURE
+        if A2023_MAX_YEAR < year <= MAX_DEVELOPMENT_YEAR:
+            return "待定", STATUS_KEEP_FUTURE
     return "待定", STATUS_KEEP_UNEXPECTED
 
 
