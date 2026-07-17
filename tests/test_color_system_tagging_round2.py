@@ -13,24 +13,31 @@ from scripts import color_system_tagging_round2 as round2
 
 
 class Round2RulesTest(unittest.TestCase):
+    def test_clean_development_year_normalizes_supported_dirty_values(self) -> None:
+        cases = {
+            "2023": "2023",
+            "2023年": "2023",
+            " 2024 ": "2024",
+            "２０２４年": "2024",
+            "历史": "历史",
+            "": "",
+            None: "",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(round2.clean_development_year(raw), expected)
+
     def test_real_value_domain_rules_are_exact(self) -> None:
+        self.assertEqual(round2.classify_development_year("2023"), ("A2023", round2.STATUS_CONVERT))
+        self.assertEqual(round2.classify_development_year("2023年"), ("A2023", round2.STATUS_CONVERT))
+        self.assertEqual(round2.classify_development_year(" 2024 "), ("A2023", round2.STATUS_CONVERT))
         self.assertEqual(round2.classify_development_year("历史"), ("A2023", round2.STATUS_CONVERT))
-        self.assertEqual(round2.classify_development_year("2024"), ("A2023", round2.STATUS_CONVERT))
         self.assertEqual(
             round2.classify_development_year("2025"),
             ("待定", round2.STATUS_KEEP_FUTURE),
         )
-        self.assertEqual(
-            round2.classify_development_year("2026"),
-            ("待定", round2.STATUS_KEEP_FUTURE),
-        )
         self.assertEqual(round2.classify_development_year(""), ("待定", round2.STATUS_KEEP_EMPTY))
-        for dirty in ("2024 ", " 2024", "歷史", "2025 ", "2023", "unknown"):
-            with self.subTest(dirty=dirty):
-                self.assertEqual(
-                    round2.classify_development_year(dirty),
-                    ("待定", round2.STATUS_KEEP_UNEXPECTED),
-                )
+        self.assertEqual(round2.classify_development_year("ABC"), ("待定", round2.STATUS_KEEP_UNEXPECTED))
 
     def test_extract_development_year_preserves_dirty_whitespace(self) -> None:
         fields = [
@@ -116,12 +123,12 @@ class Round2WorkbookTest(unittest.TestCase):
                 detail = workbook["拟打标明细"]
                 self.assertEqual([cell.value for cell in detail[1]], round2.DETAIL_HEADERS)
                 summary_values = list(workbook["汇总"].values)
-                self.assertIn(("转 A2023", 2, None), summary_values)
-                self.assertIn(("剩余待定", 3, None), summary_values)
+                self.assertIn(("转 A2023", 3, None), summary_values)
+                self.assertIn(("剩余待定", 2, None), summary_values)
                 self.assertIn(("空值", 1, None), summary_values)
-                self.assertIn(("意外值", 1, None), summary_values)
-                self.assertIn(("2024 ", 1, round2.STATUS_KEEP_UNEXPECTED), summary_values)
-                self.assertIn(("2024 ", 1, "E"), summary_values)
+                self.assertIn(("意外值", 0, None), summary_values)
+                self.assertIn(("2024 ", 1, round2.STATUS_CONVERT), summary_values)
+                self.assertIn(("（无）", 0, None), summary_values)
             finally:
                 workbook.close()
 

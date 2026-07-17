@@ -4,6 +4,11 @@
 
 默认只生成审阅清单。范围必须来自第一轮 Excel 中拟打值为“待定”的 SKU；
 正式写入只提交审阅后拟打值为 A2023 的行，其余行保持不动。
+
+开发年份判定规则：原值为“历史”，或清洗后可解析为整数年份且 <= 2024，
+转 A2023；清洗后可解析为整数年份且 >= 2025、空值、无法解析的意外值均
+维持待定，并继续输出意外值清单。清洗包含 strip 空白、去除“年”字后缀、
+全角转半角。
 """
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ import asyncio
 import json
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -134,14 +140,25 @@ def extract_development_year(value: Any) -> str:
     return "[多值]" + "|".join(values)
 
 
-def classify_development_year(raw_value: Any) -> tuple[str, str]:
+def clean_development_year(raw_value: Any) -> str:
     value = "" if raw_value is None else str(raw_value)
-    if value in {"历史", "2024"}:
+    value = unicodedata.normalize("NFKC", value).strip()
+    if value.endswith("年"):
+        value = value[:-1].strip()
+    return value
+
+
+def classify_development_year(raw_value: Any) -> tuple[str, str]:
+    value = clean_development_year(raw_value)
+    if value == "历史":
         return "A2023", STATUS_CONVERT
-    if re.fullmatch(r"\d{4}", value) and int(value) >= 2025:
-        return "待定", STATUS_KEEP_FUTURE
     if value == "":
         return "待定", STATUS_KEEP_EMPTY
+    if re.fullmatch(r"\d+", value):
+        year = int(value)
+        if year <= 2024:
+            return "A2023", STATUS_CONVERT
+        return "待定", STATUS_KEEP_FUTURE
     return "待定", STATUS_KEEP_UNEXPECTED
 
 
