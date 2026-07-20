@@ -41,6 +41,15 @@ class EligibilityTest(unittest.TestCase):
         )
         self.assertEqual(
             round1.eligibility_reason(make_row(处理优先级="P3-无销量无Listing")),
+            "P3低优先级",
+        )
+        self.assertEqual(
+            round1.eligibility_reason(
+                make_row(
+                    处理优先级="P3-无销量无Listing",
+                    是否允许未来自动写入="否-低优先级",
+                )
+            ),
             "分析结果未允许自动写入",
         )
         self.assertEqual(
