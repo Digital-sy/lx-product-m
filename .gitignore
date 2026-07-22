@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 *.log
 reports_analysis/
+inputs_private/
 .DS_Store
